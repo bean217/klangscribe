@@ -2,7 +2,7 @@ import os
 
 import dagster as dg
 
-from .jobs import DirConfig
+from .jobs.collection import DirConfig
 from .resources import PostgresResource
 
 

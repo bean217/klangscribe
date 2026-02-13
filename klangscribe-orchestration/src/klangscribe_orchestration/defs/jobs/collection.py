@@ -3,7 +3,7 @@ import shutil
 
 import dagster as dg
 
-from .resources import S3Resource, PostgresResource
+from ..resources import S3Resource, PostgresResource
 
 class DirConfig(dg.Config):
     """Configuration for file processing job."""
@@ -66,7 +66,7 @@ def process_directory(
             })
 
             total_size += file_size
-        
+
         # Store metadata in PostgreSQL
         pg.store_directory_metadata(
             dirname=dirname,
@@ -115,7 +115,6 @@ def send_notification(context: dg.OpExecutionContext, dir_info: dict):
     context.log.info(f"   Total size:                    {dir_info['total_size']} bytes")
     for file_info in dir_info['uploaded_files']:
         context.log.info(f"     - {file_info['filename']}   ->   {file_info['storage_path']} ({file_info['file_size']} bytes)")
-
 
 
 @dg.job

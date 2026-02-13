@@ -1,0 +1,6 @@
+# workspace.yaml
+load_from:
+  - grpc_server:
+      host: dagster-code-location
+      port: 4000
+      location_name: "klangscribe_orchestration"
