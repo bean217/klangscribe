@@ -4,9 +4,10 @@ import dagster as dg
 
 from .s3 import S3Resource
 from .postgres import PostgresResource
+from .directory_processing import DirectoryProcessingResource
 
 # Re-export for convenience
-__all__ = ["S3Resource", "PostgresResource"]
+__all__ = ["S3Resource", "PostgresResource", "DirectoryProcessingResource"]
 
 # Define resources with environment variables
 
@@ -27,5 +28,6 @@ def resources() -> dg.Definitions:
                 database=os.getenv("POSTGRES_DB"),
                 port=int(os.getenv("POSTGRES_PORT", "5432")),
             ),
+            "dir_proc": DirectoryProcessingResource(),
         }
     )

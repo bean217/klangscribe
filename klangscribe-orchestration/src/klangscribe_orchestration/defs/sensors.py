@@ -3,15 +3,15 @@ import os
 import dagster as dg
 
 from .jobs.collection import DirConfig
-from .resources import PostgresResource
+from .resources import DirectoryProcessingResource
 
 
 @dg.sensor(
-    job_name="dir_collection_job", 
+    job_name="dir_collection_job",
     minimum_interval_seconds=2,
     default_status=dg.DefaultSensorStatus.STOPPED
 )
-def new_file_sensor(context: dg.SensorEvaluationContext, pg: PostgresResource) -> dg.SensorResult:
+def new_file_sensor(context: dg.SensorEvaluationContext, dir_proc: DirectoryProcessingResource) -> dg.SensorResult:
     """
     Check for new directories every 10 seconds.
     Uses PostgreSQL to track which directories have been processed.
@@ -35,7 +35,7 @@ def new_file_sensor(context: dg.SensorEvaluationContext, pg: PostgresResource) -
         return dg.SkipReason("No directories found in watched folder")
     
     # Get directories already in database (processing, completed, or failed)
-    processed_dirs = pg.get_processed_directories()
+    processed_dirs = dir_proc.get_processed_directories()
 
     # Find directories that exist but haven't been processed
     new_dirs = current_dirs - processed_dirs
@@ -54,7 +54,7 @@ def new_file_sensor(context: dg.SensorEvaluationContext, pg: PostgresResource) -
 
         # Mark as processing in database (prevents duplicate processing)
         # This is atomic - uses database constraint
-        if pg.mark_directory_as_processing(dirname, run_id=None):
+        if dir_proc.mark_directory_as_processing(dirname, run_id=None):
             context.log.info(f"Triggering job for: {dirname}")
 
             yield dg.RunRequest(

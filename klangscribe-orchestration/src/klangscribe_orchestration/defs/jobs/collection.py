@@ -3,7 +3,7 @@ import shutil
 
 import dagster as dg
 
-from ..resources import S3Resource, PostgresResource
+from ..resources import S3Resource, DirectoryProcessingResource
 
 class DirConfig(dg.Config):
     """Configuration for file processing job."""
@@ -16,7 +16,7 @@ def process_directory(
     context: dg.OpExecutionContext,
     config: DirConfig,
     s3: S3Resource,
-    pg: PostgresResource,
+    dir_proc: DirectoryProcessingResource,
 ) -> dict:
     """Move directory from watched directory to S3-compatible storage and log metadata to Postgres"""
 
@@ -68,7 +68,7 @@ def process_directory(
             total_size += file_size
 
         # Store metadata in PostgreSQL
-        pg.store_directory_metadata(
+        dir_proc.store_directory_metadata(
             dirname=dirname,
             file_count=len(uploaded_files),
             total_size=total_size,
@@ -77,7 +77,7 @@ def process_directory(
         context.log.info(f"Stored metadata in PostgreSQL")
 
         # Mark as completed in processing state table
-        pg.mark_directory_as_completed(dirname)
+        dir_proc.mark_directory_as_completed(dirname)
         context.log.info(f"Marked directory as completed")
 
         return {
@@ -90,7 +90,7 @@ def process_directory(
     except Exception as e:
         # Mark as failed if processing fails
         context.log.error(f"Failed to process directory: {e}")
-        pg.mark_directory_as_failed(dirname)
+        dir_proc.mark_directory_as_failed(dirname)
         raise dg.Failure(f"Failed to process directory {dirname}: {e}")
 
 
