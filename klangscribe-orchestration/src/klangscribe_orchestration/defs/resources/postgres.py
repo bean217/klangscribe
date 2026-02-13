@@ -1,65 +1,10 @@
-import os
 import json
 
-# Required before importing boto3:
-os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_required'
-os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_required'
-import boto3
-
-from botocore.exceptions import ClientError
 import psycopg2
 from contextlib import contextmanager
 from typing import Optional
 
 import dagster as dg
-
-
-class S3Resource(dg.ConfigurableResource):
-    """Resource for interacting with an S3 object storage server."""
-
-    endpoint: Optional[str] = None
-    access_key: str
-    secret_key: str
-    region: str = "us-east-1"
-
-    def get_client(self):
-        """Get boto3 S3 client"""
-        return boto3.client(
-            's3',
-            endpoint_url=self.endpoint,
-            aws_access_key_id=self.access_key,
-            aws_secret_access_key=self.secret_key,
-            region_name=self.region,
-        )
-    
-    def upload_file(self, bucket_name: str, object_key: str, file_path: str) -> str:
-        """Uploads a file to S3-compatible storage"""
-        s3_client = self.get_client()
-
-        # Create bucket if it doesn't exist
-        try:
-            s3_client.head_bucket(Bucket=bucket_name)
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == '404':
-                # Bucket doesn't exist, create it
-                try:
-                    if self.region == 'us-east-1':
-                        s3_client.create_bucket(Bucket=bucket_name)
-                    else:
-                        s3_client.create_bucket(
-                            Bucket=bucket_name,
-                            CreateBucketConfiguration={'LocationConstraint': self.region}
-                        )
-                except ClientError as create_error:
-                    raise Exception(f"Failed to create bucket {bucket_name}: {create_error}")
-            else:
-                raise Exception(f"Failed to check bucket {bucket_name}: {e}")
-        
-        # Upload the file
-        s3_client.upload_file(file_path, bucket_name, object_key)
-
-        return f"s3://uns/138b4b75-686c-479e-8e5c-3cfc2f1eae49{bucket_name}/{object_key}"
 
 
 class PostgresResource(dg.ConfigurableResource):
@@ -120,7 +65,7 @@ class PostgresResource(dg.ConfigurableResource):
             CREATE INDEX IF NOT EXISTS idx_directory_processing_state_status
             ON directory_processing_state(status)
         """)
-    
+
     def mark_directory_as_processing(self, dirname: str, run_id: Optional[str] = None):
         """
         Mark a directory as being processed
@@ -145,7 +90,7 @@ class PostgresResource(dg.ConfigurableResource):
             except psycopg2.IntegrityError:
                 # Directory already being processed
                 return False
-    
+
     def mark_directory_as_completed(self, dirname: str):
         """Mark a directory as completed"""
         with self.get_connection() as conn:
@@ -158,7 +103,7 @@ class PostgresResource(dg.ConfigurableResource):
                 """,
                 (dirname,)
             )
-    
+
     def mark_directory_as_failed(self, dirname: str):
         """Mark a directory as failed"""
         with self.get_connection() as conn:
@@ -171,7 +116,7 @@ class PostgresResource(dg.ConfigurableResource):
                 """,
                 (dirname,)
             )
-    
+
     def get_processed_directories(self) -> set:
         """Get all directories that have been processed or are being processed"""
         with self.get_connection() as conn:
@@ -197,7 +142,7 @@ class PostgresResource(dg.ConfigurableResource):
                 (timeout_hours,)
             )
             return cursor.fetchall()
-    
+
     def cleanup_stuck_directories(self, timeout_hours: int = 24) -> int:
         """Mark old 'processing' directories as failed and return count"""
         with self.get_connection() as conn:
@@ -255,7 +200,7 @@ class PostgresResource(dg.ConfigurableResource):
                     ORDER BY uploaded_at DESC
                     """
                 )
-            
+
             return cursor.fetchall()
 
     def get_processing_stats(self) -> dict:
@@ -280,25 +225,3 @@ class PostgresResource(dg.ConfigurableResource):
             stats['total_processed'] = cursor.fetchone()[0]
 
             return stats
-
-# Define resources with environment variables
-
-@dg.definitions
-def resources() -> dg.Definitions:
-    return dg.Definitions(
-        resources={
-            "s3": S3Resource(
-                endpoint=os.getenv("S3_ENDPOINT_URL"),
-                access_key=os.getenv("S3_ACCESS_KEY"),
-                secret_key=os.getenv("S3_SECRET_KEY"),
-                region=os.getenv("S3_REGION", "us-east-1"),
-            ),
-            "pg": PostgresResource(
-                host=os.getenv("POSTGRES_HOST"),
-                user=os.getenv("POSTGRES_USER"),
-                password=os.getenv("POSTGRES_PASSWORD"),
-                database=os.getenv("POSTGRES_DB"),
-                port=int(os.getenv("POSTGRES_PORT", "5432")),
-            ),
-        }
-    )
