@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Dagster local
+.dg/
+
+# Docker files (already in build context)
+docker/
+Dockerfile*
+docker-compose*.yml
+
+# Local directories (mounted as volumes)
+watch_dir/
+
+# Environment files (mounted as volumes)
+.env
+.env.*
+
+# Development files
+tests/
+Makefile
+README.md
+*.md
+LICENSE
+
+# OS files
+Thumbs.db

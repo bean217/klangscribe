@@ -1,0 +1,6 @@
+# workspace.yaml
+load_from:
+  - grpc_server:
+      host: localhost
+      port: 4000
+      location_name: "klangscribe_orchestration_local"

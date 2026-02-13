@@ -1,0 +1,73 @@
+services:
+  ray-head:
+    image: rayproject/ray:latest-gpu
+    container_name: ray-head
+    shm_size: '8gb'   # Increase for GPU workloads
+    runtime: nvidia   # Enable GPU access
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RAY_SCHEDULER_EVENTS=1
+    command: >
+      ray start --head
+      --port=6379
+      --dashboard-host=0.0.0.0
+      --dashboard-port=8265
+      --ray-client-server-port=10001
+      --node-ip-address=0.0.0.0
+      --block
+      --disable-usage-stats
+    ports:
+      - "8265:8265"   # Ray dashboard
+      - "6379:6379"   # Ray GCS server
+      - "10001:10001" # Ray client server (for remote connections)
+    networks:
+      - ray-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  
+  # GPU wrokers - scale based on available GPUs
+  ray-worker:
+    image: rayproject/ray:latest-gpu
+    shm_size: '8gb'
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RAY_SCHEDULER_EVENTS=1
+    command: >
+      ray start
+      --address=ray-head:6379
+      --block
+    networks:
+      - ray-network
+    depends_on:
+      - ray-head
+    deploy:
+      replicas: 1   # Adjust based on GPU count
+      resources: 
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # Each worker gets 1 GPU
+              capabilities: [gpu]
+  
+  # Cloudflare Tunnel to expose Ray to external services
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflare-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - ray-network
+    depends_on:
+      - ray-head
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+
+networks:
+  ray-network:
+    driver: bridge

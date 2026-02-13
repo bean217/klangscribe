@@ -1,0 +1,36 @@
+# docker/dagster/Dockerfile_code
+# Full image with application code and dependencies
+
+# Stage 1: Install Dependencies
+FROM python:3.11-slim AS builder
+
+WORKDIR /opt/dagster/app
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy dependency files from project root
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies using uv
+RUN uv sync --frozen --no-dev
+
+
+# Stage 2: Runtime image
+FROM python:3.11-slim
+
+WORKDIR /opt/dagster/app
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/dagster/app/.venv /opt/dagster/app/.venv
+
+# Copy source code from project root
+COPY src /opt/dagster/app/src
+
+# Create mount points
+RUN mkdir -p /mnt/watch_dir
+
+# Set environment
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+ENV PATH="/opt/dagster/app/.venv/bin:$PATH"
+# ENV PYTHONPATH="/opt/dagster/app/src:$PYTHONPATH"     # Not sure why this would be needed
