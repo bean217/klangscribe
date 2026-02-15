@@ -9,7 +9,7 @@ from botocore.exceptions import ClientError
 from typing import Optional
 
 import dagster as dg
-
+    
 
 class S3Resource(dg.ConfigurableResource):
     """Resource for interacting with an S3 object storage server."""
@@ -28,11 +28,8 @@ class S3Resource(dg.ConfigurableResource):
             aws_secret_access_key=self.secret_key,
             region_name=self.region,
         )
-
-    def upload_file(self, bucket_name: str, object_key: str, file_path: str) -> str:
-        """Uploads a file to S3-compatible storage"""
-        s3_client = self.get_client()
-
+    
+    def _validate_bucket(self, s3_client, bucket_name: str) -> None:
         # Create bucket if it doesn't exist
         try:
             s3_client.head_bucket(Bucket=bucket_name)
@@ -53,7 +50,23 @@ class S3Resource(dg.ConfigurableResource):
             else:
                 raise Exception(f"Failed to check bucket {bucket_name}: {e}")
 
+    def upload_file(self, bucket_name: str, object_key: str, file_path: str) -> str:
+        """Uploads a file to S3-compatible storage"""
+        s3_client = self.get_client()
+
+        # Ensure bucket exists
+        self._validate_bucket(s3_client, bucket_name)
+
         # Upload the file
         s3_client.upload_file(file_path, bucket_name, object_key)
 
-        return f"s3://uns/138b4b75-686c-479e-8e5c-3cfc2f1eae49{bucket_name}/{object_key}"
+        return f"{bucket_name}/{object_key}"
+    
+    def put_bytes(self, bucket_name: str, obj_key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        s3_client = self.get_client()
+
+        # Ensure bucket exists
+        self._validate_bucket(s3_client, bucket_name)
+
+        # Write bytes
+        s3_client.put_object(Bucket=bucket_name, Key=obj_key, Body=data, ContentType=content_type)

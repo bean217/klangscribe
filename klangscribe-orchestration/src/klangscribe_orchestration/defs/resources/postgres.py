@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from typing import Optional, Dict, Any
+from urllib.parse import quote_plus
 
 import dagster as dg
 from pydantic import PrivateAttr
@@ -19,7 +20,7 @@ class PostgresResource(dg.ConfigurableResource):
 
     def _get_engine(self):
         if self._engine is None:
-            url = f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+            url = f"postgresql+psycopg2://{quote_plus(self.user)}:{quote_plus(self.password)}@{self.host}:{self.port}/{self.database}"
             self._engine = create_engine(url)
         return self._engine
 
