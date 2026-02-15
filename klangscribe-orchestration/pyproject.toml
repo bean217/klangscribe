@@ -7,6 +7,7 @@ dependencies = [
     "dagster==1.12.13",
     "dagster-postgres>=0.28.13",
     "dagster-webserver",
+    "ffmpeg-python>=0.2.0",
     "pandas>=2.3.3",
     "polars>=1.38.1",
     "psycopg2-binary>=2.9.11",
