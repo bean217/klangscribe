@@ -2,8 +2,12 @@ import os
 import io
 import re
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import time
+import traceback
+from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes
 from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import dagster as dg
 import polars as pl
@@ -189,6 +193,8 @@ def raw_manifest_parquet(
             uploaded_at AS uploaded_at
         FROM
             directory_metadata
+        LIMIT
+            1000
     """
 
     # list of songs from data collection metadata table
@@ -226,6 +232,70 @@ def raw_manifest_parquet(
 
 #### Helpers ####
 
+@dataclass
+class MergeResult:
+    dir_id: str
+    dirname: str
+    song_wav_bucket: Optional[str]
+    song_wav_prefix: Optional[str]
+    song_wav_key: Optional[str]
+    status: str
+    error: Optional[str]
+
+
+def _get_parent_asset_metadata(context: dg.AssetExecutionContext, asset_key: List[str]):
+    instance = context.instance
+    materialization_event = instance.get_latest_materialization_event(
+        dg.AssetKey(asset_key)
+    )
+
+    if materialization_event and materialization_event.asset_materialization:
+        metadata = materialization_event.asset_materialization.metadata
+        return metadata
+    else:
+        raise ValueError(f"No materialization found for asset with key: {asset_key}")
+    
+
+def _merge_one_dir(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    opus_paths_json: str,
+    out_bucket: str,
+    out_prefix: str,
+    target_sample_rate: int = 22050
+) -> MergeResult:
+    """
+    Merges multiple .opus files for a single song directory into a single .wav file, and stores this result into s3.
+    """
+    try:
+        opus_paths = json.loads(opus_paths_json)
+        if not opus_paths:
+            return MergeResult(dir_id, dirname, None, None, None, "skipped_no_opus", "opus_paths_json empty")
+        
+        # (1) download .opus files from s3 into memory
+        opus_bytes_list: List[io.BytesIO] = []
+        for opus_path in opus_paths:
+            bucket, key = opus_path.split("/", 1)
+            opus_bytes_io = s3.get_object(bucket_name=bucket, obj_key=key)
+            opus_bytes_list.append(opus_bytes_io)
+        
+        # (2) convert and merge .opus files into a single .wav byte stream
+        wav_bytes: List[io.BytesIO] = [opus_to_wav_bytes(opus_bytes, target_sample_rate) for opus_bytes in opus_bytes_list]
+        merged_wav_bytes = merge_wav_bytes(wav_bytes)
+
+        # (3) store merged .wav back to s3
+        song_wav_key = f"{out_prefix}/{dirname}/song.wav"
+        s3.put_bytes(bucket_name=out_bucket, obj_key=song_wav_key, data=merged_wav_bytes.getvalue(), content_type="audio/wav")
+
+        return MergeResult(dir_id, dirname, out_bucket, out_prefix, song_wav_key, "success", None)
+
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tb_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tb_str])
+        return MergeResult(dir_id, dirname, None, None, None, "error", err_str)
+
 
 #### Asset Definitions ####
 
@@ -235,7 +305,10 @@ def raw_manifest_parquet(
     deps=[["raw", "manifest_parquet"]],
     kinds={"python", "s3", "parquet"}
 )
-def raw_ini_metadata() -> dg.MaterializeResult:
+def raw_ini_metadata(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
     """
     Extracts song.ini metadata from manifest_parquet, creating a record of essential Clone Hero song
     metadata, which will be useful for later exploratory data analysis.
@@ -248,7 +321,10 @@ def raw_ini_metadata() -> dg.MaterializeResult:
     deps=[["raw", "manifest_parquet"]],
     kinds={"python", "s3", "parquet"}
 )
-def raw_chart_data() -> dg.MaterializeResult:
+def raw_chart_data(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
     return dg.MaterializeResult()
 
 
@@ -257,5 +333,97 @@ def raw_chart_data() -> dg.MaterializeResult:
     deps=[["raw", "manifest_parquet"]],
     kinds={"python", "s3", "parquet"}
 )
-def raw_song_data() -> dg.MaterializeResult:
-    return dg.MaterializeResult()
+def raw_song_data(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
+    """
+    Merges multiple .opus audio files into a single `song.wav` file for a single song,
+    and stores this result into s3 at: data-collection/transformed/audio/<song_name>/song.wav 
+    """
+    # (1) Read parquet to locate s3 files
+    
+    # retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "manifest_parquet"])
+
+    manifest_bucket_entry = parent_asset_metadata.get('manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+
+    manifest_key_entry = parent_asset_metadata.get('manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+
+    context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
+
+    # define s3 storage bucket/key/obj name for merged song wav files
+    out_bucket = manifest_bucket
+    out_prefix = "transformed/audio"
+
+    # parse parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "opus_paths"])
+
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded manifest: {total_rows} directories")
+
+    results: List[MergeResult] = []
+    success = 0
+    err = 0
+
+    # define total number of concurrent workers based on the system
+    max_workers = max(2, (os.cpu_count() or 8) // 2)
+    # Submit tasks
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(_merge_one_dir, s3, row["dir_id"], row["dirname"], row["opus_paths"], out_bucket, out_prefix)
+            for row in manifest_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+            else:
+                err += 1
+            
+            if i % 200 == 0:
+                context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
+    end = time.perf_counter()
+    
+    context.log.info(f"Completed merging audio for {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds using {max_workers} workers")
+
+    # write updated manifest (add song_opus path + status/error)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_merged_audio_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "song_wav_bucket": [r.song_wav_bucket for r in results],
+            "song_wav_prefix": [r.song_wav_prefix for r in results],
+            "song_wav_key": [r.song_wav_key for r in results],
+            "merge_status": [r.status for r in results],
+            "merge_error": [r.error for r in results]
+        }
+    )
+
+    # Write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
+
+    return dg.MaterializeResult(
+        metadata={
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "songs_total": dg.MetadataValue.int(total_rows),
+            "songs_success": dg.MetadataValue.int(success),
+            "songs_error": dg.MetadataValue.int(err),
+            "workers_used": dg.MetadataValue.int(max_workers)
+        }
+    )

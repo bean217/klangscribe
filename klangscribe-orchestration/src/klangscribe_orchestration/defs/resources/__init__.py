@@ -28,6 +28,6 @@ def resources() -> dg.Definitions:
                 database=os.getenv("POSTGRES_DB"),
                 port=int(os.getenv("POSTGRES_PORT", "5432")),
             ),
-            "dir_proc": DirectoryProcessingResource(),
+            "dir_proc": DirectoryProcessingResource()
         }
     )

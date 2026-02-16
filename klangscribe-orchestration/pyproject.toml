@@ -3,11 +3,13 @@ name = "klangscribe_orchestration"
 requires-python = ">=3.10,<3.15"
 version = "0.1.0"
 dependencies = [
+    "av>=16.1.0",
     "boto3>=1.42.39",
     "dagster==1.12.13",
     "dagster-postgres>=0.28.13",
     "dagster-webserver",
     "ffmpeg-python>=0.2.0",
+    "numpy>=2.2.6",
     "pandas>=2.3.3",
     "polars>=1.38.1",
     "psycopg2-binary>=2.9.11",

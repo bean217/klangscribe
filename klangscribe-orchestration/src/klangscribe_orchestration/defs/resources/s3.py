@@ -1,15 +1,23 @@
 import os
+import io
+import time
+import logging
 
 # Required before importing boto3:
-os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_required'
-os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_required'
+os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_supported'
+os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_supported'
+
 import boto3
 
+from botocore.config import Config
 from botocore.exceptions import ClientError
+from pydantic import PrivateAttr
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 import dagster as dg
-    
+
 
 class S3Resource(dg.ConfigurableResource):
     """Resource for interacting with an S3 object storage server."""
@@ -19,15 +27,25 @@ class S3Resource(dg.ConfigurableResource):
     secret_key: str
     region: str = "us-east-1"
 
+    _client: Optional[object] = PrivateAttr(default=None)
+
     def get_client(self):
-        """Get boto3 S3 client"""
-        return boto3.client(
-            's3',
-            endpoint_url=self.endpoint,
-            aws_access_key_id=self.access_key,
-            aws_secret_access_key=self.secret_key,
-            region_name=self.region,
-        )
+        """Get boto3 S3 client (cached, thread-safe)."""
+        if self._client is None:
+            self._client = boto3.client(
+                's3',
+                endpoint_url=self.endpoint,
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=self.region,
+                config=Config(
+                    max_pool_connections=20,
+                    retries={'max_attempts': 3, 'mode': 'adaptive'},
+                    connect_timeout=10,
+                    read_timeout=30,
+                ),
+            )
+        return self._client
     
     def _validate_bucket(self, s3_client, bucket_name: str) -> None:
         # Create bucket if it doesn't exist
@@ -70,3 +88,29 @@ class S3Resource(dg.ConfigurableResource):
 
         # Write bytes
         s3_client.put_object(Bucket=bucket_name, Key=obj_key, Body=data, ContentType=content_type)
+
+    def get_object(self, bucket_name: str, obj_key: str, max_retries: int = 3):
+        """
+        Reads a single s3 object into memory, retrying on NoSuchKey to guard
+        against transient 404s from S3-compatible backends under concurrent load.
+        """
+        s3_client = self.get_client()
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = s3_client.get_object(Bucket=bucket_name, Key=obj_key)
+                file_content = response['Body'].read()
+                return io.BytesIO(file_content)
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code in ('NoSuchKey', '404') and attempt < max_retries:
+                    delay = 2 ** attempt  # 2s, 4s
+                    logger.warning(
+                        "get_object attempt %d/%d failed for %s/%s (NoSuchKey), retrying in %ds",
+                        attempt, max_retries, bucket_name, obj_key, delay
+                    )
+                    time.sleep(delay)
+                    last_err = e
+                else:
+                    raise
+        raise last_err  # unreachable, but satisfies type checkers
