@@ -7,6 +7,7 @@
 
 import io
 import os
+import re
 import polars as pl
 from pathlib import Path
 
@@ -82,7 +83,94 @@ def add_ini_metadata_to_df(df: pl.DataFrame, metadata: dict) -> pl.DataFrame:
     row = {key: metadata.get(key, None) for key in CLONE_HERO_METADATA_KEYS}
     return df.with_row(pl.Series(row))
 
+
 #########################
 #   .chart Processing   #
 #########################
 
+
+def _parse_song_section(section_content: str) -> dict:
+    pass
+
+
+def _parse_synctrack_section(section_content: str) -> dict:
+    pass
+
+
+def _parse_events_section(section_content: str) -> dict:
+    pass
+
+
+def _parse_expertsingle_section(section_content: str) -> dict:
+    pass
+
+
+class ChartProcessor:
+    """
+    Class for processing a single .chart file, which contains the note data for a Clone Hero song.
+    Note: Only extracts [ExpertSingle] guitar chart data for the purposes of this project.
+
+    References:
+        - .chart file format:   https://docs.google.com/document/d/1v2v0U-9HQ5qHeccpExDOLJ5CMPZZ3QytPmAG5WF0Kzs/mobilebasic
+        - CH documentation:     https://github.com/TheNathannator/GuitarGame_ChartFormats/tree/main/docs/Chart-File-Formats/chart-format
+        - Audio2Hero Code Ref:  https://github.com/3podi/audio2chart/blob/main/chart/chart_processor.py
+    """
+
+    def __init__(self):
+        
+        # .chart file section definitions (only a subset of sections are relevant for our purposes)
+        self.sections = [
+            "Song",             # general song metadata (overlaps with .ini metadata, but may contain additional fields)
+            "SyncTrack",        # tempo and time signature changes
+            "Events",           # misc events like section markers and lyric cues
+            "ExpertSingle"      # expert single guitar chart data
+        ]
+
+        # Regex patterns for identifying section headers
+        self.section_regexes = {
+            section_header: re.compile(rf'\[{section_header}\]\s*\{{(.*?)\}}', re.DOTALL)
+            for section_header in self.sections
+        }
+
+        # regex for extracting relevant metadata fields from the [Song] section of the .chart file
+        self.metadata_regex = r'(Resolution)\s*=\s*"?([^"\n]+)"?'   # only need the resolution field
+
+    def parse_chart(self, chart_byte_stream: io.BytesIO) -> None:
+        """
+        Parses the given .chart file byte stream and extracts relevant metadata and note data.
+        """
+
+        # extracted chart section data will be stored here
+        section_content = {}
+
+        # read .chart file bytes and decode to text
+        chart_byte_stream.seek(0)
+        chart_text = chart_byte_stream.read().decode('utf-8-sig')
+
+        # extract sections using regex
+        for section, regex in self.section_regexes.items():
+            match = regex.search(chart_text)
+            if match:
+                section_content = match.group(1).strip()
+                section_content[section] = section_content
+        
+        # extract relevant metadata from each section
+        extracted_metadata = {}
+        if "Song" in section_content:
+            song_section = section_content["Song"]
+            extracted_metadata = _parse_song_section(song_section)
+        
+        # extract tempo and time signature changes from SyncTrack section
+        if "SyncTrack" in section_content:
+            synctrack_section = section_content["SyncTrack"]
+            extracted_metadata.update(_parse_synctrack_section(synctrack_section))
+        
+        # extract events from Events section
+        if "Events" in section_content:
+            events_section = section_content["Events"]
+            extracted_metadata.update(_parse_events_section(events_section))
+        
+        # extract expert single guitar chart data from ExpertSingle section
+        if "ExpertSingle" in section_content:
+            expertsingle_section = section_content["ExpertSingle"]
+            extracted_metadata.update(_parse_expertsingle_section(expertsingle_section))
