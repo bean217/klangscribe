@@ -5,6 +5,7 @@ import json
 import time
 import traceback
 from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes
+from ...utils.raw_processing import parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -193,8 +194,6 @@ def raw_manifest_parquet(
             uploaded_at AS uploaded_at
         FROM
             directory_metadata
-        LIMIT
-            1000
     """
 
     # list of songs from data collection metadata table
@@ -233,12 +232,21 @@ def raw_manifest_parquet(
 #### Helpers ####
 
 @dataclass
-class MergeResult:
+class AudioMergeResult:
     dir_id: str
     dirname: str
     song_wav_bucket: Optional[str]
     song_wav_prefix: Optional[str]
     song_wav_key: Optional[str]
+    status: str
+    error: Optional[str]
+
+
+@dataclass
+class MetadataMergeResult:
+    dir_id: str
+    dirname: str
+    data: Optional[Dict[str, str]]
     status: str
     error: Optional[str]
 
@@ -256,6 +264,27 @@ def _get_parent_asset_metadata(context: dg.AssetExecutionContext, asset_key: Lis
         raise ValueError(f"No materialization found for asset with key: {asset_key}")
     
 
+def _extract_ini_metadata(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    ini_path: str,
+) -> MetadataMergeResult:
+    """
+    Extracts metadata from the .ini file for a song directory, returning this data as a dictionary.
+    """
+    try:
+        ini_bucket, ini_key = ini_path.split("/", 1)
+        ini_bytes = s3.get_object(bucket_name=ini_bucket, obj_key=ini_key)
+        metadata = parse_ini_file(ini_bytes)
+        return MetadataMergeResult(dir_id, dirname, metadata, "success", None)
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tb_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tb_str])
+        return MetadataMergeResult(dir_id, dirname, None, "error", err_str)
+
+
 def _merge_one_dir(
     s3: S3Resource,
     dir_id: str,
@@ -264,14 +293,14 @@ def _merge_one_dir(
     out_bucket: str,
     out_prefix: str,
     target_sample_rate: int = 22050
-) -> MergeResult:
+) -> AudioMergeResult:
     """
     Merges multiple .opus files for a single song directory into a single .wav file, and stores this result into s3.
     """
     try:
         opus_paths = json.loads(opus_paths_json)
         if not opus_paths:
-            return MergeResult(dir_id, dirname, None, None, None, "skipped_no_opus", "opus_paths_json empty")
+            return AudioMergeResult(dir_id, dirname, None, None, None, "skipped_no_opus", "opus_paths_json empty")
         
         # (1) download .opus files from s3 into memory
         opus_bytes_list: List[io.BytesIO] = []
@@ -288,13 +317,13 @@ def _merge_one_dir(
         song_wav_key = f"{out_prefix}/{dirname}/song.wav"
         s3.put_bytes(bucket_name=out_bucket, obj_key=song_wav_key, data=merged_wav_bytes.getvalue(), content_type="audio/wav")
 
-        return MergeResult(dir_id, dirname, out_bucket, out_prefix, song_wav_key, "success", None)
+        return AudioMergeResult(dir_id, dirname, out_bucket, out_prefix, song_wav_key, "success", None)
 
     except Exception as e:
         tbe = traceback.TracebackException.from_exception(e)
         tb_str = ''.join(tbe.format())
         err_str = '\n'.join([str(e), tb_str])
-        return MergeResult(dir_id, dirname, None, None, None, "error", err_str)
+        return AudioMergeResult(dir_id, dirname, None, None, None, "error", err_str)
 
 
 #### Asset Definitions ####
@@ -312,8 +341,111 @@ def raw_ini_metadata(
     """
     Extracts song.ini metadata from manifest_parquet, creating a record of essential Clone Hero song
     metadata, which will be useful for later exploratory data analysis.
+    Data is stored in s3 as a .parquet file stored at data-collection/transformed/song_metadata.parquet
     """
-    return dg.MaterializeResult()
+
+    # (1) Read parquet to locate s3 files
+
+    # retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "manifest_parquet"])
+
+    manifest_bucket_entry = parent_asset_metadata.get('manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+
+    manifest_key_entry = parent_asset_metadata.get('manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+
+    context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
+
+    # define s3 storage bucket/key/obj name for merged song wav files
+    out_bucket = manifest_bucket
+    out_prefix = "transformed"
+
+    # parse parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "ini_path"])
+
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded manifest: total={total_rows} directories")
+
+    # (2) extract .ini metadata for each song and store results in a new parquet file in s3
+    results: List[MetadataMergeResult] = []
+    success = 0
+    err = 0
+
+    ini_metadata_dicts: List[Dict[str, str]] = []
+
+    # Submit tasks
+    start = time.perf_counter()
+    with ThreadPoolExecutor() as ex:
+        futures = [
+            ex.submit(_extract_ini_metadata, s3, row["dir_id"], row["dirname"], row["ini_path"])
+            for row in manifest_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+                ini_metadata_dicts.append(r.data if r.data else {})
+            else:
+                err += 1
+            
+            if i % 50 == 0:
+                context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
+    end = time.perf_counter()
+
+    context.log.info(f"Completed extracting .ini metadata for {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds")
+
+    # (4) Write .ini metadata parquet to s3 (for later analysis, separate from the manifest parquet which is more focused on file paths and processing status)
+    out_metadata_bucket = manifest_bucket
+    out_metadata_key = f"transformed/ini_metadata_{context.run_id}.parquet"
+    buf = io.BytesIO()
+    ini_metadata_df = pl.from_dicts(ini_metadata_dicts)
+    ini_metadata_df.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=out_metadata_bucket, obj_key=out_metadata_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    # (4) Write transformation manifest to s3:
+
+    # write updated manifest (record status/error of ini metadata extraction)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_ini_metadata_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
+            "ini_metadata": [json.dumps(r.data) if r.data else None for r in results],
+            "metadata_extraction_status": [r.status for r in results],
+            "metadata_extraction_error": [r.error for r in results] 
+        }
+    )
+
+    # write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
+
+    return dg.MaterializeResult(
+        metadata={
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "metadata_bucket": dg.MetadataValue.text(out_metadata_bucket),
+            "metadata_key": dg.MetadataValue.text(out_metadata_key),
+            "metadata_extraction_success": dg.MetadataValue.int(success),
+            "metadata_extraction_error": dg.MetadataValue.int(err)
+        }
+    )
+
+
+
+
+
 
 
 @dg.asset(
@@ -326,6 +458,12 @@ def raw_chart_data(
     s3: S3Resource
 ) -> dg.MaterializeResult:
     return dg.MaterializeResult()
+
+
+
+
+
+
 
 
 @dg.asset(
@@ -367,15 +505,13 @@ def raw_song_data(
     total_rows = manifest_df.height
     context.log.info(f"Loaded manifest: {total_rows} directories")
 
-    results: List[MergeResult] = []
+    results: List[dict] = []
     success = 0
     err = 0
 
-    # define total number of concurrent workers based on the system
-    max_workers = max(2, (os.cpu_count() or 8) // 2)
     # Submit tasks
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with ThreadPoolExecutor() as ex:
         futures = [
             ex.submit(_merge_one_dir, s3, row["dir_id"], row["dirname"], row["opus_paths"], out_bucket, out_prefix)
             for row in manifest_df.iter_rows(named=True)
@@ -389,11 +525,11 @@ def raw_song_data(
             else:
                 err += 1
             
-            if i % 200 == 0:
+            if i % 50 == 0:
                 context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
     end = time.perf_counter()
     
-    context.log.info(f"Completed merging audio for {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds using {max_workers} workers")
+    context.log.info(f"Completed merging audio for {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds")
 
     # write updated manifest (add song_opus path + status/error)
     out_manifest_bucket = manifest_bucket
@@ -401,6 +537,7 @@ def raw_song_data(
     out_df = pl.DataFrame(
         {
             "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
             "song_wav_bucket": [r.song_wav_bucket for r in results],
             "song_wav_prefix": [r.song_wav_prefix for r in results],
             "song_wav_key": [r.song_wav_key for r in results],
@@ -423,7 +560,6 @@ def raw_song_data(
             "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
             "songs_total": dg.MetadataValue.int(total_rows),
             "songs_success": dg.MetadataValue.int(success),
-            "songs_error": dg.MetadataValue.int(err),
-            "workers_used": dg.MetadataValue.int(max_workers)
+            "songs_error": dg.MetadataValue.int(err)
         }
     )

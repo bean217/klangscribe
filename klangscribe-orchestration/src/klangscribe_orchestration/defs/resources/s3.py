@@ -4,8 +4,8 @@ import time
 import logging
 
 # Required before importing boto3:
-os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_supported'
-os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_supported'
+os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_required'
+os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_required'
 
 import boto3
 
