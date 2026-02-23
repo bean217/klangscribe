@@ -195,8 +195,6 @@ def raw_manifest_parquet(
             uploaded_at AS uploaded_at
         FROM
             directory_metadata
-        LIMIT
-            10;
     """
 
     # list of songs from data collection metadata table
