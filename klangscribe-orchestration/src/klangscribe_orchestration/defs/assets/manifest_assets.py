@@ -5,12 +5,13 @@ import json
 import time
 import traceback
 from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes
-from ...utils.raw_processing import parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df
+from ...utils.raw_processing import parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df, parse_chart_file
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import dagster as dg
+import numpy as np
 import polars as pl
 import pyarrow as pa
 from ..resources import PostgresResource, S3Resource
@@ -194,6 +195,8 @@ def raw_manifest_parquet(
             uploaded_at AS uploaded_at
         FROM
             directory_metadata
+        LIMIT
+            10;
     """
 
     # list of songs from data collection metadata table
@@ -243,6 +246,17 @@ class AudioMergeResult:
 
 
 @dataclass
+class ChartDataResult:
+    dir_id: str
+    dirname: str
+    song_chart_bucket: Optional[str]
+    song_chart_prefix: Optional[str]
+    song_chart_key: Optional[str]
+    status: str
+    error: Optional[str]
+
+
+@dataclass
 class MetadataMergeResult:
     dir_id: str
     dirname: str
@@ -285,6 +299,42 @@ def _extract_ini_metadata(
         return MetadataMergeResult(dir_id, dirname, None, "error", err_str)
 
 
+def _extract_chart_data(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    chart_path: str,
+    out_bucket: str,
+    out_prefix: str
+) -> ChartDataResult:
+    """
+    Extracts note sequence data from the .chart file for a song directory, vectorizing this data and storing it as a .npz file in s3.
+    """
+    try:
+        if not chart_path:
+            return ChartDataResult(dir_id, dirname, None, None, None, "skipped_no_chart", "No chart path provided")
+
+        # (1) download .chart file from s3 into memory
+        chart_bucket, chart_key = chart_path.split("/", 1)
+        chart_bytes = s3.get_object(bucket_name=chart_bucket, obj_key=chart_key)
+
+        # (2) parse .chart file and extract note sequence data into numpy arrays
+        resolution, offset, tempo_changes, note_data = parse_chart_file(chart_bytes)
+
+        # (3) store extracted data as .npz back to s3
+        chart_data_key = f"{dirname}/chart_data.npz"
+        chart_data_stream = io.BytesIO()
+        np.savez(chart_data_stream, resolution=resolution, offset=offset, tempo_changes=tempo_changes, note_data=note_data)
+        s3.put_bytes(bucket_name=out_bucket, obj_key=f"{out_prefix}/{chart_data_key}", data=chart_data_stream.getvalue(), content_type="application/octet-stream")
+
+        return ChartDataResult(dir_id, dirname, out_bucket, out_prefix, chart_data_key, "success", None)
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tbe_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tbe_str])
+        return ChartDataResult(dir_id, dirname, None, None, None, "error", err_str)
+
+
 def _merge_one_dir(
     s3: S3Resource,
     dir_id: str,
@@ -314,8 +364,8 @@ def _merge_one_dir(
         merged_wav_bytes = merge_wav_bytes(wav_bytes)
 
         # (3) store merged .wav back to s3
-        song_wav_key = f"{out_prefix}/{dirname}/song.wav"
-        s3.put_bytes(bucket_name=out_bucket, obj_key=song_wav_key, data=merged_wav_bytes.getvalue(), content_type="audio/wav")
+        song_wav_key = f"{dirname}/song.wav"
+        s3.put_bytes(bucket_name=out_bucket, obj_key=f"{out_prefix}/{song_wav_key}", data=merged_wav_bytes.getvalue(), content_type="audio/wav")
 
         return AudioMergeResult(dir_id, dirname, out_bucket, out_prefix, song_wav_key, "success", None)
 
@@ -358,10 +408,6 @@ def raw_ini_metadata(
         manifest_key = manifest_key_entry.value
 
     context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
-
-    # define s3 storage bucket/key/obj name for merged song wav files
-    out_bucket = manifest_bucket
-    out_prefix = "transformed"
 
     # parse parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
@@ -457,9 +503,98 @@ def raw_chart_data(
     context: dg.AssetExecutionContext,
     s3: S3Resource
 ) -> dg.MaterializeResult:
-    return dg.MaterializeResult()
+    """
+    Converts .chart files for each song into a vectorized format representing the note sequences, and stores this result in s3.
+    Each song is represented as an .npz file containing numpy arrays for:
+    - sync track (BPM changes)
+    - note tracks (tick-based note sequences)
+    - metadata (song resolution, offset)
+    """
+    # (1) Read parquet to locate s3 files
 
+    # retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "manifest_parquet"])
 
+    manifest_bucket_entry = parent_asset_metadata.get('manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+
+    manifest_key_entry = parent_asset_metadata.get('manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+
+    context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
+
+    # define s3 storage backet/key/obj name for vectorized chart data
+    out_bucket = manifest_bucket
+    out_prefix = "transformed/chart"
+
+    # parse parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "chart_path"])
+
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded manifest: total={total_rows} directories")
+
+    results: List[dict] = []
+    success = 0
+    err = 0
+
+    # Submit tasks
+    start = time.perf_counter()
+
+    with ThreadPoolExecutor() as ex:
+        futures = [
+            ex.submit(_extract_chart_data, s3, row["dir_id"], row["dirname"], row["chart_path"], out_bucket, out_prefix)
+            for row in manifest_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+            else:
+                err += 1
+            
+            if i % 50 == 0:
+                context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
+
+    end = time.perf_counter()
+    context.log.info(f"Completed processing {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds")
+
+    # write updated manifest (record status/error of chart data extraction)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_chart_data_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
+            "song_chart_bucket": [r.song_chart_bucket for r in results],
+            "song_chart_prefix": [r.song_chart_prefix for r in results],
+            "song_chart_key": [r.song_chart_key for r in results],
+            "chart_data_extraction_status": [r.status for r in results],
+            "chart_data_extraction_error": [r.error for r in results] 
+        }
+    )
+
+    # write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
+
+    return dg.MaterializeResult(
+        metadata={
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "songs_total": dg.MetadataValue.int(total_rows),
+            "songs_chart_extraction_success": dg.MetadataValue.int(success),
+            "songs_chart_extraction_error": dg.MetadataValue.int(err)
+        }
+    )
 
 
 

@@ -535,3 +535,12 @@ def convert_notes_to_seconds(notes: np.ndarray, bpm_events: np.ndarray, resoluti
         note_times.append([absolute_time] + note_pressed_data.tolist() + note_press_durations + [note_type])
     
     return note_times
+
+
+
+def parse_chart_file(chart_byte_stream: io.BytesIO) -> tuple[int, float, np.ndarray, np.ndarray]:
+    """
+    Parses the given .chart file byte stream and extracts relevant metadata and note data.
+    """
+    chart_processor = ChartProcessor()
+    return chart_processor.parse_chart(chart_byte_stream)
