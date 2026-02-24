@@ -115,6 +115,9 @@ class SongMetadata(CloneHeroSection):
         if key == "Resolution":
             self.resolution = int(value)
         elif key == "Offset":
+            # value may be in an international format with a comma as the decimal separator,
+            # so we replace it with a dot before converting to float
+            value = value.replace(',', '.')
             self.offset = float(value)
         else:
             # we can ignore other metadata fields for the purposes of this project,
@@ -276,14 +279,25 @@ class InstrumentTrack(CloneHeroSection):
 
     def append(self, tick: int, chart_val: int, sustain_length: int):
         # determine if new note marker refers to a new note or an update to the previous note marker (e.g. for sustains or adding frets)
-        if not self.note_markers or tick != self.note_markers[-1].tick:
+        is_new_note = (not self.note_markers) or (tick != self.note_markers[-1].tick)
+        
+        if is_new_note:
             # new note marker
             marker = NoteFrame(tick=tick)
-            self.note_markers.append(marker)
         else:
+            # update to previous note marker
             marker = self.note_markers[-1]
+
+        try:
+            marker.update(chart_val, sustain_length)
+            if is_new_note:
+                self.note_markers.append(marker)
+        except Exception as e:
+            # When Clone Hero encounters malformed note data in a .chart file, it simply ignores the problematic note and continues processing the rest of the chart without crashing.
+            # To be robust against potential issues in the .chart files we process, we will do the same by catching any exceptions that occur when updating a note marker and logging a warning, 
+            # but allowing processing to continue for the rest of the chart.
+            print(f"Warning: Skipping note at tick {tick} with chart value {chart_val} due to error: {e}")        
         
-        marker.update(chart_val, sustain_length)
     
     def to_numpy(self) -> np.ndarray:
         # convert the note marker in this track to a numpy array representation for easier processing
@@ -348,7 +362,8 @@ class ChartProcessor:
 
         # read .chart file bytes and decode to text
         chart_byte_stream.seek(0)
-        chart_text = chart_byte_stream.read().decode('utf-8-sig')
+        # using 'utf-8-sig' to handle potential BOM in .chart files, and ignoring decoding errors to be robust against malformed files
+        chart_text = chart_byte_stream.read().decode('utf-8-sig', errors='ignore')
 
         # extract sections using regex
         for section, regex in self.section_regexes.items():
