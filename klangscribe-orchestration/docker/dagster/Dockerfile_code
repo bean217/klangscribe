@@ -8,7 +8,7 @@ WORKDIR /opt/dagster/app
 RUN pip install uv --upgrade pip && pip install uv
 
 # Install apt dependencies
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files from project root
 COPY pyproject.toml uv.lock ./
