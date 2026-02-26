@@ -22,6 +22,7 @@ services:
     environment:
       - PYTHONPATH=/opt/dagster/app/src
       - DAGSTER_HOME=/opt/dagster/dagster_home
+      - PRODUCTION=true
     restart: unless-stopped
 
   # Dagster Webserver

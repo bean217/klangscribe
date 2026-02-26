@@ -5,7 +5,6 @@ import dagster as dg
 from .jobs.collection import DirConfig
 from .resources import DirectoryProcessingResource
 
-
 @dg.sensor(
     job_name="dir_collection_job",
     minimum_interval_seconds=2,
@@ -17,7 +16,7 @@ def new_file_sensor(context: dg.SensorEvaluationContext, dir_proc: DirectoryProc
     Uses PostgreSQL to track which directories have been processed.
     """
     
-    watch_dir = "/mnt/watch_dir"
+    watch_dir = os.getenv("WATCH_DIR", "/mnt/watch_dir")
     max_dirs_per_run = int(os.getenv("SENSOR_BATCH_SIZE", "20"))
 
     # Get current directories on disk

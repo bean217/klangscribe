@@ -696,3 +696,39 @@ def raw_song_data(
             "songs_error": dg.MetadataValue.int(err)
         }
     )
+
+
+@dg.asset(
+    key=dg.AssetKey(["raw", "canonical_dataset"]),
+    ins={
+        "raw_ini_metadata": dg.AssetIn(["raw", "ini_metadata"]),
+        "raw_chart_data": dg.AssetIn(["raw", "chart_data"]),
+        "raw_song_data": dg.AssetIn(["raw", "song_data"])
+    }
+)
+def canonical_dataset(
+    context: dg.AssetExecutionContext,
+    raw_ini_metadata: dg.MaterializeResult,
+    raw_chart_data: dg.MaterializeResult,
+    raw_song_data: dg.MaterializeResult
+) -> dg.MaterializeResult:
+    """
+    Combines the outputs of the previous three assets (manifest parquet, ini metadata parquet, chart data npz files, merged song wav files)
+    into a single canonical dataset, which can be easily consumed for downstream analysis and modeling.
+    This asset doesn't do any new transformations itself, but serves to link together the outputs of the previous assets and provide a single source of truth for downstream consumers.
+    """
+    # For this example, we'll just log the inputs and return a success status.
+    # In a real implementation, you might want to combine these inputs into a single data structure or store them in a more accessible format for downstream use.
+    
+    context.log.info(f"Received raw_ini_metadata with metadata: {raw_ini_metadata.metadata}")
+    context.log.info(f"Received raw_chart_data with metadata: {raw_chart_data.metadata}")
+    context.log.info(f"Received raw_song_data with metadata: {raw_song_data.metadata}")
+
+    return dg.MaterializeResult(
+        metadata={
+            "status": dg.MetadataValue.text("success"),
+            "raw_ini_metadata": dg.MetadataValue.text(str(raw_ini_metadata.metadata)),
+            "raw_chart_data": dg.MetadataValue.text(str(raw_chart_data.metadata)),
+            "raw_song_data": dg.MetadataValue.text(str(raw_song_data.metadata))
+        }
+    )
