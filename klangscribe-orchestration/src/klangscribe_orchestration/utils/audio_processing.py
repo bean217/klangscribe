@@ -12,6 +12,7 @@ import ffmpeg
 import tempfile
 import numpy as np
 from pathlib import Path
+from pydub import AudioSegment
 
 
 #############################
@@ -111,3 +112,27 @@ def merge_wav_bytes(wav_bytes_list: list[io.BytesIO]) -> io.BytesIO:
     if process.returncode != 0:
         raise Exception(f"ffmpeg conversion failed: {stderr.decode('utf-8')}")
     return io.BytesIO(stdout)
+
+
+def merge_opus_bytes(opus_bytes_list: list[io.BytesIO]) -> io.BytesIO:
+    """
+    Merges multiple .opus byte streams into a single .opus byte stream.
+    """
+
+    # combine .opus files using pydub
+    audio_files = [AudioSegment.from_file(b, format="ogg") for b in opus_bytes_list]
+
+    # start with the first audio and overlay the rest
+    mixed = audio_files[0]
+    for audio in audio_files[1:]:
+        mixed = mixed.overlay(audio)
+    
+    # normalize combined audio to prevent clipping
+    if mixed.max_dBFS > 0.0:
+        mixed = mixed.apply_gain(-mixed.max_dBFS)
+    
+    # export combined audio to .opus bytes
+    output_bytes = io.BytesIO()
+    mixed.export(output_bytes, format="ogg", codec="libopus")
+    output_bytes.seek(0)
+    return output_bytes

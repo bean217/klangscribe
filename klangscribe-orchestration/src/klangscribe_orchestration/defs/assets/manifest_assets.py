@@ -4,7 +4,7 @@ import re
 import json
 import time
 import traceback
-from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes
+from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes, merge_opus_bytes
 from ...utils.raw_processing import parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df, parse_chart_file
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -698,37 +698,148 @@ def raw_song_data(
     )
 
 
+# ----------------------------------------------------- #
+#   Merge Opus files into a single opus file per song   #
+# ----------------------------------------------------- #
+
+# HELPERS
+
+def _merge_one_song(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    opus_paths_json: str,
+    out_bucket: str,
+    out_prefix: str
+) -> AudioMergeResult:
+    """
+    Merges multiple .opus files for a single song directory into a single .opus file, and stores this result into s3.
+    """
+    try:
+        opus_paths = json.loads(opus_paths_json)
+        if not opus_paths:
+            return AudioMergeResult(dir_id, dirname, None, None, None, "skipped_no_opus", "opus_paths_json empty")
+        
+        # (1) download .opus files from s3 into memory
+        opus_bytes_list: List[io.BytesIO] = []
+        for opus_path in opus_paths:
+            bucket, key = opus_path.split("/", 1)
+            opus_bytes_io = s3.get_object(bucket_name=bucket, obj_key=key)
+            opus_bytes_list.append(opus_bytes_io)
+        
+        # (2) merge .opus files into a single .opus byte stream
+        merged_opus_bytes = merge_opus_bytes(opus_bytes_list)
+
+        # (3) store merged .opus back to s3
+        song_opus_key = f"{dirname}/song.opus"
+        s3.put_bytes(bucket_name=out_bucket, obj_key=f"{out_prefix}/{song_opus_key}", data=merged_opus_bytes.getvalue(), content_type="audio/opus")
+
+        return AudioMergeResult(dir_id, dirname, out_bucket, out_prefix, song_opus_key, "success", None)
+
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tb_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tb_str])
+        return AudioMergeResult(dir_id, dirname, None, None, None, "error", err_str)
+
+# ASSET DEFINITION
+
 @dg.asset(
-    key=dg.AssetKey(["raw", "canonical_dataset"]),
-    ins={
-        "raw_ini_metadata": dg.AssetIn(["raw", "ini_metadata"]),
-        "raw_chart_data": dg.AssetIn(["raw", "chart_data"]),
-        "raw_song_data": dg.AssetIn(["raw", "song_data"])
-    }
+    key=dg.AssetKey(["raw", "opus_data"]),
+    deps=[["raw", "manifest_parquet"]],
+    kinds={"python", "s3", "parquet"}
 )
-def canonical_dataset(
+def raw_opus_data(
     context: dg.AssetExecutionContext,
-    raw_ini_metadata: dg.MaterializeResult,
-    raw_chart_data: dg.MaterializeResult,
-    raw_song_data: dg.MaterializeResult
-) -> dg.MaterializeResult:
+    s3: S3Resource
+):
     """
-    Combines the outputs of the previous three assets (manifest parquet, ini metadata parquet, chart data npz files, merged song wav files)
-    into a single canonical dataset, which can be easily consumed for downstream analysis and modeling.
-    This asset doesn't do any new transformations itself, but serves to link together the outputs of the previous assets and provide a single source of truth for downstream consumers.
+    Merges multiple .opus audio files into a single `song.opus` file for a single song,
+    and stores this result into s3 at: data-collection/transformed/opus/<song_name>/song.opus.
+
+    This asset is a more storage-efficient alternative to `raw_song_data` which merges .opus files into a single .wav file.
     """
-    # For this example, we'll just log the inputs and return a success status.
-    # In a real implementation, you might want to combine these inputs into a single data structure or store them in a more accessible format for downstream use.
+    # (1) Read parquet to locate s3 files
     
-    context.log.info(f"Received raw_ini_metadata with metadata: {raw_ini_metadata.metadata}")
-    context.log.info(f"Received raw_chart_data with metadata: {raw_chart_data.metadata}")
-    context.log.info(f"Received raw_song_data with metadata: {raw_song_data.metadata}")
+    # retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "manifest_parquet"])
+
+    manifest_bucket_entry = parent_asset_metadata.get('manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+
+    manifest_key_entry = parent_asset_metadata.get('manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+
+    context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
+
+    # define s3 storage bucket/key/obj name for merged opus files
+    out_bucket = manifest_bucket
+    out_prefix = "transformed/opus"
+
+    # parse parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "opus_paths"]).head(100)   # limit to 10 songs for testing
+
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded manifest: total={total_rows} directories")
+
+    results: List[dict] = []
+    success = 0
+    err = 0
+
+    # Submit tasks
+    start = time.perf_counter()
+    with ThreadPoolExecutor() as ex:
+        futures = [
+            ex.submit(_merge_one_song, s3, row["dir_id"], row["dirname"], row["opus_paths"], out_bucket, out_prefix)
+            for row in manifest_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+            else:
+                err += 1
+            
+            if i % 50 == 0:
+                context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
+    end = time.perf_counter()
+
+    context.log.info(f"Completed merging opus audio for {total_rows} directories with {success} successes and {err} errors in {end - start:.2f} seconds")
+
+    # write updated manifest (add song_opus path + status/error)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_merged_opus_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
+            "song_opus_bucket": [r.song_wav_bucket for r in results],
+            "song_opus_prefix": [r.song_wav_prefix for r in results],
+            "song_opus_key": [r.song_wav_key for r in results],
+            "merge_status": [r.status for r in results],
+            "merge_error": [r.error for r in results]
+        }
+    )
+
+    # Write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
 
     return dg.MaterializeResult(
         metadata={
-            "status": dg.MetadataValue.text("success"),
-            "raw_ini_metadata": dg.MetadataValue.text(str(raw_ini_metadata.metadata)),
-            "raw_chart_data": dg.MetadataValue.text(str(raw_chart_data.metadata)),
-            "raw_song_data": dg.MetadataValue.text(str(raw_song_data.metadata))
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "songs_total": dg.MetadataValue.int(total_rows),
+            "songs_success": dg.MetadataValue.int(success),
+            "songs_error": dg.MetadataValue.int(err)
         }
     )
