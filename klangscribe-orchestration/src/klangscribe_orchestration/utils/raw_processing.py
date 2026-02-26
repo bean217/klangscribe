@@ -484,7 +484,7 @@ def tick_to_seconds(tick: int, bpm_ticks: np.ndarray,bpm_segments: list[tuple[in
     return base_time + delta_time
 
 
-def convert_notes_to_seconds(notes: np.ndarray, bpm_events: np.ndarray, resolution: int, offset: float):
+def convert_notes_to_seconds(notes: np.ndarray, bpm_events: np.ndarray, resolution: int, offset: float) -> np.ndarray:
     """
     Converts notes from tick-based timing to absolute time in seconds
     
@@ -549,8 +549,36 @@ def convert_notes_to_seconds(notes: np.ndarray, bpm_events: np.ndarray, resoluti
         # (4) create a new note frame with absolute time and the rest of the note data
         note_times.append([absolute_time] + note_pressed_data.tolist() + note_press_durations + [note_type])
     
+    # (5) convert list of note frames to numpy array for easier processing
+    note_times = np.array(note_times, dtype=float)
+
     return note_times
 
+
+def calculate_note_density_summary(note_frames: np.ndarray) -> tuple[float, float, float, float, float]:
+    """
+    Utility function to calculate summary statistics about note onset times for a given song.
+    Includes:
+    - average note onset delta time (in seconds)
+    - median note onset delta time (in seconds)
+    - minimum delta time between consecutive note onsets (in seconds)
+    - maximum delta time between consecutive note onsets (in seconds)
+    - standard deviation of delta times between consecutive note onsets (in seconds)
+    """
+    if note_frames is None or note_frames.shape[0] < 2:
+        raise ValueError("At least two note frames are required to calculate note density summary")
+    
+    # calculate delta times between consecutive note frames
+    delta_times = np.diff(note_frames[:, 0])  # assuming the first column of each note frame is the absolute time in seconds
+
+    # calculate summary statistics (between the first and last note onsets, ignoring sustains)
+    avg_delta = np.mean(delta_times)  # average time between note onsets in seconds
+    median_delta = np.median(delta_times)  # median time between note onsets in seconds
+    min_delta = np.min(delta_times)
+    max_delta = np.max(delta_times)
+    std_delta = np.std(delta_times)
+
+    return avg_delta, median_delta, min_delta, max_delta, std_delta
 
 
 def parse_chart_file(chart_byte_stream: io.BytesIO) -> tuple[int, float, np.ndarray, np.ndarray]:

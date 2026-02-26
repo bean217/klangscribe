@@ -62,11 +62,16 @@ S3_REGION=us-east-1
 
 # Other settings
 WATCH_DIR=/path/to/watch_dir
+DATA_LIMIT=100
 ```
 
 * `WATCH_DIR`
     * This is the directory path that Dagster watches for data collection
     * This must be set when working in local development mode, otherwise data collection will fail
+* `DATA_LIMIT`
+    * Used for testing purposes only
+    * Enables materializing Dagster assets without needing to wait for all of the data to process at each step
+    * **Not used when running inside a container**
 
 When working in local development mode, it is strongly advised to run Dagster using the `dg dev` command:
 ```bash

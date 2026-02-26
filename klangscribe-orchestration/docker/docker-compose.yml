@@ -22,6 +22,7 @@ services:
     environment:
       - PYTHONPATH=/opt/dagster/app/src
       - DAGSTER_HOME=/opt/dagster/dagster_home
+      - WATCH_DIR=/mnt/watch_dir
       - PRODUCTION=true
     restart: unless-stopped
 
@@ -44,7 +45,6 @@ services:
       - ../dagster.yaml:/opt/dagster/dagster_home/dagster.yaml
     environment:
       - DAGSTER_HOME=/opt/dagster/dagster_home
-      - WATCH_DIR=/mnt/watch_dir
     depends_on:
       - dagster-code-location
     restart: unless-stopped

@@ -5,7 +5,10 @@ import json
 import time
 import traceback
 from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes, merge_opus_bytes
-from ...utils.raw_processing import parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df, parse_chart_file
+from ...utils.raw_processing import (
+    parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df, parse_chart_file,
+    convert_notes_to_seconds, calculate_note_density_summary
+)
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +17,7 @@ import dagster as dg
 import numpy as np
 import polars as pl
 import pyarrow as pa
+from psycopg2 import sql
 from ..resources import PostgresResource, S3Resource
 
 
@@ -185,20 +189,44 @@ def raw_manifest_parquet(
       - .ini (Clone Hero song metadata file)
     """
     
-    query: str = """
-        SELECT
-            id AS dir_id,
-            dirname AS dirname,
-            file_count AS file_count,
-            total_size AS total_size,
-            files_json AS files_json, 
-            uploaded_at AS uploaded_at
-        FROM
-            directory_metadata
-    """
-
-    # list of songs from data collection metadata table
-    result_rows = pg.fetchall(query)
+    if os.getenv("PRODUCTION", "false").lower() == "true":
+        context.log.info("Running in PRODUCTION mode: processing all songs in PostgreSQL")
+        query: str = """
+            SELECT
+                id AS dir_id,
+                dirname AS dirname,
+                file_count AS file_count,
+                total_size AS total_size,
+                files_json AS files_json, 
+                uploaded_at AS uploaded_at
+            FROM
+                directory_metadata
+        """
+        # list of songs from data collection metadata table
+        result_rows = pg.fetchall(query)
+    else:
+        context.log.info("Running in TEST mode: processing only a subset of songs from PostgreSQL (for faster iteration during development)")
+        query: str = """
+            SELECT
+                id AS dir_id,
+                dirname AS dirname,
+                file_count AS file_count,
+                total_size AS total_size,
+                files_json AS files_json, 
+                uploaded_at AS uploaded_at
+            FROM
+                directory_metadata
+            LIMIT
+                :limit
+        """
+        try:
+            limit = int(os.getenv("DATA_LIMIT", "10"))
+        except ValueError:
+            context.log.warning(f"Invalid DATA_LIMIT value: {os.getenv('DATA_LIMIT')}, defaulting to 10")
+            limit = 10
+        params = {'limit': limit}
+        # list of songs from data collection metadata table
+        result_rows = pg.fetchall(query, params)
 
     # Filter song records missing the proper files
     rows, metadata = _collect_valid_songs(result_rows)
@@ -523,7 +551,7 @@ def raw_chart_data(
 
     context.log.info(f"located manifest: bucket={manifest_bucket}, key={manifest_key}")
 
-    # define s3 storage backet/key/obj name for vectorized chart data
+    # define s3 storage bucket/key/obj name for vectorized chart data
     out_bucket = manifest_bucket
     out_prefix = "transformed/chart"
 
@@ -841,5 +869,219 @@ def raw_opus_data(
             "songs_total": dg.MetadataValue.int(total_rows),
             "songs_success": dg.MetadataValue.int(success),
             "songs_error": dg.MetadataValue.int(err)
+        }
+    )
+
+
+# --------------------------------------------- #
+#   Absolute-Time Chart File Conversion Asset   #
+# --------------------------------------------- #
+
+# HELPERS
+
+@dataclass
+class ChartDataAbsTimeStats:
+    min_note_separation_sec: Optional[float]
+    avg_note_separation_sec: Optional[float]
+    max_note_separation_sec: Optional[float]
+    stddev_note_separation_sec: Optional[float]
+    median_note_separation_sec: Optional[float]
+
+@dataclass
+class ChartDataAbsTimeResult:
+    dir_id: str
+    dirname: str
+    song_chart_bucket: Optional[str]
+    song_chart_prefix: Optional[str]
+    song_chart_key: Optional[str]
+    data: Optional[ChartDataAbsTimeStats]
+    status: str
+    error: Optional[str]
+
+def _extract_chart_data_absolute_time(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    chart_bucket: str,
+    chart_prefix: str,
+    chart_key: str,
+    out_bucket: str,
+    out_prefix: str
+) -> ChartDataAbsTimeResult:
+    """
+    Converts .chart files for each song into a vectorized format representing the note sequences in absolute time (seconds), and stores this result in s3. 
+    This is derived from raw_chart_data but represents note sequences in absolute time rather than tick-based format.
+    This will be used by raw_chart_data_fixed_grid asset which will convert this absolute-time data into a fixed time grid representation for easier use in machine learning models.
+    """
+    try:
+        if not all([chart_bucket, chart_prefix, chart_key]):
+            return ChartDataAbsTimeResult(dir_id, dirname, None, None, None, None, "skipped_no_chart", "No chart path provided")
+        
+        # (1) download raw chart data .npz file from s3 into memory
+        chart_npz_bytes = s3.get_object(bucket_name=chart_bucket, obj_key=f"{chart_prefix}/{chart_key}")
+
+        # (2) load .npz file
+        chart_data = np.load(chart_npz_bytes)
+        resolution = chart_data["resolution"].item()
+        offset = chart_data["offset"].item()
+        tempo_changes = chart_data["tempo_changes"]  # shape (num_tempo_changes, 2) with columns [tick, bpm]
+        note_data = chart_data["note_data"]  # shape (num_notes, 3) with columns [tick, lane, duration]
+
+        # (3) convert tick-based note data into absolute time (seconds)
+        note_data_abs_time = convert_notes_to_seconds(note_data, tempo_changes, resolution, offset)
+        # 5-number summary stats on note density (note separation in seconds)
+        avg_delta, med_delta, min_delta, max_delta, std_delta = calculate_note_density_summary(note_data_abs_time)
+
+        stats = ChartDataAbsTimeStats(
+            min_note_separation_sec=min_delta,
+            avg_note_separation_sec=avg_delta,
+            max_note_separation_sec=max_delta,
+            stddev_note_separation_sec=std_delta,
+            median_note_separation_sec=med_delta
+        )
+
+        # (4) store absolute-time note data as .npy file back to s3
+        abs_time_chart_data_key = f"{dirname}/chart_data_abs_time.npy"
+        abs_time_chart_data_stream = io.BytesIO()
+        np.save(abs_time_chart_data_stream, note_data_abs_time)
+        s3.put_bytes(bucket_name=out_bucket, obj_key=f"{out_prefix}/{abs_time_chart_data_key}", data=abs_time_chart_data_stream.getvalue(), content_type="application/octet-stream")
+
+        return ChartDataAbsTimeResult(dir_id, dirname, out_bucket, out_prefix, abs_time_chart_data_key, stats, "success", None)
+
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tb_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tb_str])
+        return ChartDataAbsTimeResult(dir_id, dirname, None, None, None, None, "error", err_str)
+
+# ASSET DEFINITION
+
+@dg.asset(
+    key=dg.AssetKey(["raw", "chart_data_absolute_time"]),
+    deps=[["raw", "chart_data"]],
+    kinds={"python", "s3", "parquet"}
+)
+def raw_chart_data_absolute_time(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
+    """
+    Converts .chart files for each song into a vectorized format representing the note sequences in absolute time (milliseconds),
+    and stores this result in s3. This is an alternative to `raw_chart_data` which represents note sequences in tick-based format.
+    Each song is represented as an .npz file containing numpy arrays for:
+    - sync track (BPM changes with absolute time)
+    - note tracks (absolute-time note sequences)
+    - metadata (song resolution, offset)
+    """
+    # retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "chart_data"])
+
+    manifest_bucket_entry = parent_asset_metadata.get('output_manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+    
+    manifest_key_entry = parent_asset_metadata.get('output_manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+    
+    context.log.info(f"located parent asset manifest: bucket={manifest_bucket}, key={manifest_key}")
+    
+    # define s3 storage bucket/key/obj name for absolute-time vectorized chart data
+    out_bucket = manifest_bucket
+    out_prefix = "transformed/chart_absolute_time"
+    # parse parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
+
+    results: List[dict] = []
+    success = 0
+    err = 0
+
+    # Submit tasks
+    start = time.perf_counter()
+    with ThreadPoolExecutor() as ex:
+        futures = [
+            ex.submit(
+                _extract_chart_data_absolute_time,
+                s3,
+                row["dir_id"],
+                row["dirname"],
+                row["song_chart_bucket"],
+                row["song_chart_prefix"],
+                row["song_chart_key"],
+                out_bucket,
+                out_prefix
+            )
+            for row in manifest_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+            else:
+                err += 1
+            
+            if i % 50 == 0:
+                context.log.info(f"Progress: {i}/{total_rows} success={success} error={err}")
+
+    end = time.perf_counter()
+    context.log.info(f"Completed chart data extraction in {end - start:.2f} seconds")
+
+    # (1) write updated manifest (record status/error of chart data extraction)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_chart_data_absolute_time_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
+            "song_chart_bucket": [r.song_chart_bucket for r in results],
+            "song_chart_prefix": [r.song_chart_prefix for r in results],
+            "song_chart_key": [r.song_chart_key for r in results],
+            "chart_data_extraction_status": [r.status for r in results],
+            "chart_data_extraction_error": [r.error for r in results] 
+        }
+    )
+    
+    # write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
+
+    # (2) write summary stats of note density (in seconds) to parquet for later analysis
+    stats_data_bucket = manifest_bucket
+    stats_data_key = f"transformed/chart_absolute_time_stats_{context.run_id}.parquet"
+    successful_results = [r for r in results if r.status == "success"]
+    stats_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in successful_results],
+            "dirname": [r.dirname for r in successful_results],
+            "min_note_separation_sec": [r.data.min_note_separation_sec if r.data else None for r in successful_results],
+            "avg_note_separation_sec": [r.data.avg_note_separation_sec if r.data else None for r in successful_results],
+            "max_note_separation_sec": [r.data.max_note_separation_sec if r.data else None for r in successful_results],
+            "stddev_note_separation_sec": [r.data.stddev_note_separation_sec if r.data else None for r in successful_results],
+            "median_note_separation_sec": [r.data.median_note_separation_sec if r.data else None for r in successful_results]
+        }
+    )
+    buf = io.BytesIO()
+    stats_df.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=stats_data_bucket, obj_key=stats_data_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    # (3) return materialization result with metadata about the operation
+    return dg.MaterializeResult(
+        metadata={
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "stats_data_bucket": dg.MetadataValue.text(stats_data_bucket),
+            "stats_data_key": dg.MetadataValue.text(stats_data_key),
+            "songs_total": dg.MetadataValue.int(total_rows),
+            "chart_data_extraction_success": dg.MetadataValue.int(success),
+            "chart_data_extraction_error": dg.MetadataValue.int(err)
         }
     )
