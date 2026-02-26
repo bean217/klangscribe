@@ -780,7 +780,7 @@ def raw_opus_data(
 
     # parse parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
-    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "opus_paths"]).head(100)   # limit to 10 songs for testing
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "opus_paths"])
 
     total_rows = manifest_df.height
     context.log.info(f"Loaded manifest: total={total_rows} directories")
