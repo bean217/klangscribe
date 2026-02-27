@@ -112,10 +112,13 @@ def main():
     parser = argparse.ArgumentParser(description="Download .opus files from S3")
     
     # S3 connection parameters
-    parser.add_argument("--s3_endpoint", type=str, required=True, help="S3 endpoint URL")
-    parser.add_argument("--s3_access_key", type=str, required=True, help="S3 access key")
-    parser.add_argument("--s3_secret_key", type=str, required=True, help="S3 secret key")
-    parser.add_argument("--s3_region", type=str, default="us-east-1", help="S3 region")
+    s3_endpoint = os.getenv("S3_ENDPOINT_URL")
+    s3_access_key = os.getenv("S3_ACCESS_KEY")
+    s3_secret_key = os.getenv("S3_SECRET_KEY")
+    s3_region = os.getenv("S3_REGION", "us-east-1")
+
+    if not all([s3_endpoint, s3_access_key, s3_secret_key]):
+        raise ValueError("Missing S3 connection parameters. Please set S3_ENDPOINT_URL, S3_ACCESS_KEY, and S3_SECRET_KEY in the environment or .env file.")
     
     # S3 bucket and prefix to list objects under
     parser.add_argument("--bucket_name", type=str, required=True, help="S3 bucket name")
@@ -127,10 +130,10 @@ def main():
     args = parser.parse_args()
 
     s3_resource = S3Resource(
-        endpoint=args.s3_endpoint,
-        access_key=args.s3_access_key,
-        secret_key=args.s3_secret_key,
-        region=args.s3_region,
+        endpoint=s3_endpoint,
+        access_key=s3_access_key,
+        secret_key=s3_secret_key,
+        region=s3_region,
     )
 
     download_opus(s3_resource, args.bucket_name, args.prefix, args.output_dir)
