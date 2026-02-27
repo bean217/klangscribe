@@ -56,7 +56,7 @@ def _download_single_opus(s3_resource: S3Resource, bucket_name: str, object_key:
     """Helper function to download a single .opus file given its S3 object key."""
     try:
         song_name = os.path.basename(os.path.dirname(object_key))  # extract song name from path
-        local_path = os.path.join(output_dir, f"{song_name}.opus")
+        local_path = os.path.join(output_dir, song_name, "song.opus")
         s3_resource.download_file(bucket_name, object_key, local_path)
         return OpusRetrievalResult(local_path=local_path, success=True)
     except Exception as e:
