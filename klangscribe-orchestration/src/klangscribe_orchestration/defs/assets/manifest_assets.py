@@ -462,7 +462,8 @@ def raw_ini_metadata(
             results.append(r)
             if r.status == "success":
                 success += 1
-                ini_metadata_dicts.append(r.data if r.data else {})
+                metadata_dict = {'dir_id': r.dir_id, **(r.data or {})}  # combine dir_id with extracted metadata for easier analysis later
+                ini_metadata_dicts.append(metadata_dict)
             else:
                 err += 1
             
@@ -871,6 +872,29 @@ def raw_opus_data(
             "songs_error": dg.MetadataValue.int(err)
         }
     )
+
+
+# ---------------------------------------------- #
+#   Log Mel Spectrogram Audio Extraction Asset   #
+# ---------------------------------------------- #
+
+# HELPERS
+
+
+# ASSET DEFINITION
+
+# @dg.asset(
+#     key=dg.AssetKey(["raw", "log_mel_spectrogram"]),
+#     deps=[["raw", "opus_data"]],
+#     kinds={"python", "s3", "parquet"}
+# )
+# def raw_mel_spectrogram(
+#     context: dg.AssetExecutionContext,
+#     s3: S3Resource
+# ) -> dg.MaterializeResult:
+#     """
+#     Converts """
+#     pass
 
 
 # --------------------------------------------- #
@@ -1293,5 +1317,129 @@ def raw_chart_data_fixed_grid(
             "song_success": dg.MetadataValue.int(success),
             "song_error": dg.MetadataValue.int(err),
             "songs_filtered": dg.MetadataValue.int(filtered_df.height),
+        }
+    )
+
+
+###################################
+#   Dataset Construction Assets   #
+###################################
+
+# Contains assets for producing a canonical dataset to upload to Kaggle for future use
+# Note: The dataset must be made private with request-access enabled in Kaggle
+
+########################################
+#   Canonical Dataset Manifest Asset   #
+########################################
+
+@dg.asset(
+    key=dg.AssetKey(["dataset", "canonical_manifest"]),
+    deps=[["raw", "opus_data"], ["raw", "chart_data"], ["raw", "ini_metadata"]],
+    kinds={"python", "s3", "parquet"}
+)
+def dataset_canonical_manifest(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
+    """
+    Creates a canonical manifest parquet file which combines all the relevant metadata and file paths from the raw assets, and stores this result in s3. 
+    This manifest will be used for constructing the final dataset for upload to Kaggle, and it will also serve as a reference for all the data files in the dataset.
+    """
+
+    # retrieve previous asset instances for raw_chart_data, raw_ini_metadata, and raw_opus_data to get the manifest bucket/key and locate the relevant s3 files
+    ini_metadata_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "ini_metadata"])
+    chart_data_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "chart_data"])
+    opus_data_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "opus_data"])
+
+    # (1) get ini_metadata manifest and ini_metadata data parquet
+
+    # ini_metadata manifest
+    ini_manifest_bucket_entry = ini_metadata_metadata.get('output_manifest_bucket')
+    if ini_manifest_bucket_entry:
+        ini_manifest_bucket = ini_manifest_bucket_entry.value
+    ini_manifest_key_entry = ini_metadata_metadata.get('output_manifest_key')
+    if ini_manifest_key_entry:
+        ini_manifest_key = ini_manifest_key_entry.value
+    
+    # ini_metadata data
+    ini_metadata_bucket_entry = ini_metadata_metadata.get('metadata_bucket')
+    if ini_metadata_bucket_entry:
+        ini_metadata_bucket = ini_metadata_bucket_entry.value
+    ini_metadata_key_entry = ini_metadata_metadata.get('metadata_key')
+    if ini_metadata_key_entry:
+        ini_metadata_key = ini_metadata_key_entry.value
+
+    # read ini_metadata manifest parquet into memory, and filter for successful rows, selecting only the dir_id column
+    ini_manifest_bytes = s3.get_object(bucket_name=ini_manifest_bucket, obj_key=ini_manifest_key)
+    ini_manifest_df = pl.read_parquet(ini_manifest_bytes).filter(pl.col("metadata_extraction_status") == "success")
+    ini_manifest_df = ini_manifest_df.select(["dir_id"])
+
+    # read ini_metadata data parquet into memory
+    ini_metadata_bytes = s3.get_object(bucket_name=ini_metadata_bucket, obj_key=ini_metadata_key)
+    ini_metadata_df = pl.read_parquet(ini_metadata_bytes)
+
+
+    # (2) get chart_data manifest
+    chart_manifest_bucket_entry = chart_data_metadata.get('output_manifest_bucket')
+    if chart_manifest_bucket_entry:
+        chart_manifest_bucket = chart_manifest_bucket_entry.value
+    chart_manifest_key_entry = chart_data_metadata.get('output_manifest_key')
+    if chart_manifest_key_entry:    
+        chart_manifest_key = chart_manifest_key_entry.value
+    
+    # read chart_data manifest parquet into memory, and filter for successful rows
+    chart_manifest_bytes = s3.get_object(bucket_name=chart_manifest_bucket, obj_key=chart_manifest_key)
+    chart_manifest_df = pl.read_parquet(chart_manifest_bytes).filter(pl.col("chart_data_extraction_status") == "success")
+    chart_manifest_df = chart_manifest_df.select(["dir_id", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
+
+    # (3) get opus_data manifest
+    opus_manifest_bucket_entry = opus_data_metadata.get('output_manifest_bucket')
+    if opus_manifest_bucket_entry:
+        opus_manifest_bucket = opus_manifest_bucket_entry.value
+    opus_manifest_key_entry = opus_data_metadata.get('output_manifest_key')
+    if opus_manifest_key_entry:
+        opus_manifest_key = opus_manifest_key_entry.value
+    
+    # read opus_data manifest parquet into memory, and filter for successful rows
+    opus_manifest_bytes = s3.get_object(bucket_name=opus_manifest_bucket, obj_key=opus_manifest_key)
+    opus_manifest_df = pl.read_parquet(opus_manifest_bytes).filter(pl.col("merge_status") == "success")
+    opus_manifest_df = opus_manifest_df.select(["dir_id", "song_opus_bucket", "song_opus_prefix", "song_opus_key"])
+
+    # (4) join ini_metadata, chart_data, and opus_data dataframes on dir_id to create the canonical manifest dataframe
+    manifest_df = ini_manifest_df.join(chart_manifest_df, on="dir_id", how="inner").join(opus_manifest_df, on="dir_id", how="inner")
+
+    # store canonical manifest in s3
+    manifest_bucket = ini_manifest_bucket
+    manifest_key = f"manifests/manifest_canonical_{context.run_id}.parquet"
+    buf = io.BytesIO()
+    manifest_df.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=manifest_bucket, obj_key=manifest_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    # (5) filter out any rows from the ini_metadata data parquet which are missing from the manifest_df after the join
+    ini_metadata_df = ini_metadata_df.join(manifest_df.select("dir_id"), on="dir_id", how="inner")
+
+    # store filtered ini_metadata data in s3
+    filtered_ini_metadata_bucket = ini_metadata_bucket
+    filtered_ini_metadata_key = f"canonical/ini_metadata_{context.run_id}.parquet"
+    buf = io.BytesIO()
+    ini_metadata_df.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=filtered_ini_metadata_bucket, obj_key=filtered_ini_metadata_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    return dg.MaterializeResult(
+        metadata={
+            # canonical manifest and metadata file paths
+            "canonical_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "canonical_manifest_key": dg.MetadataValue.text(manifest_key),
+            "canonical_ini_metadata_bucket": dg.MetadataValue.text(filtered_ini_metadata_bucket),
+            "canonical_ini_metadata_key": dg.MetadataValue.text(filtered_ini_metadata_key),
+            # input manifests and metadata file paths
+            "input_ini_metadata_manifest_bucket": dg.MetadataValue.text(ini_manifest_bucket),
+            "input_ini_metadata_manifest_key": dg.MetadataValue.text(ini_manifest_key),
+            "input_ini_metadata_bucket": dg.MetadataValue.text(ini_metadata_bucket),
+            "input_ini_metadata_key": dg.MetadataValue.text(ini_metadata_key),
+            "input_chart_data_manifest_bucket": dg.MetadataValue.text(chart_manifest_bucket),
+            "input_chart_data_manifest_key": dg.MetadataValue.text(chart_manifest_key),
+            "input_opus_data_manifest_bucket": dg.MetadataValue.text(opus_manifest_bucket),
+            "input_opus_data_manifest_key": dg.MetadataValue.text(opus_manifest_key),
         }
     )

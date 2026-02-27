@@ -59,7 +59,7 @@ def parse_ini_file(ini_bytes: io.BytesIO) -> dict:
     Parses a .ini file from bytes and returns a dictionary of Clone Hero song metadata.
     """
     ini_bytes.seek(0)
-    content = ini_bytes.read().decode('utf-8', errors='ignore')
+    content = ini_bytes.read().decode('utf-8')
     metadata = {}
     CH_ini_keys = set(CLONE_HERO_METADATA_KEYS)
     for line in content.splitlines():
@@ -362,8 +362,8 @@ class ChartProcessor:
 
         # read .chart file bytes and decode to text
         chart_byte_stream.seek(0)
-        # using 'utf-8-sig' to handle potential BOM in .chart files, and ignoring decoding errors to be robust against malformed files
-        chart_text = chart_byte_stream.read().decode('utf-8-sig', errors='ignore')
+        # using 'utf-8-sig' to handle potential BOM in .chart files
+        chart_text = chart_byte_stream.read().decode('utf-8-sig')
 
         # extract sections using regex
         for section, regex in self.section_regexes.items():
