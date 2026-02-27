@@ -987,8 +987,8 @@ def raw_chart_data_absolute_time(
     out_prefix = "transformed/chart_absolute_time"
     # parse parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
-    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
-    manifest_df = manifest_df.filter(pl.col("chart_data_extraction_status") == "success")
+    manifest_df = pl.read_parquet(manifest_bytes).filter(pl.col("chart_data_extraction_status") == "success")
+    manifest_df = manifest_df.select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
     total_rows = manifest_df.height
     context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
 
@@ -1177,8 +1177,8 @@ def raw_chart_data_fixed_grid(
 
     # parse manifest parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
-    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
-    manifest_df = manifest_df.filter(pl.col("chart_data_extraction_status") == "success")
+    manifest_df = pl.read_parquet(manifest_bytes).filter(pl.col("chart_data_extraction_status") == "success")
+    manifest_df = manifest_df.select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
     total_rows = manifest_df.height
     context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
 
