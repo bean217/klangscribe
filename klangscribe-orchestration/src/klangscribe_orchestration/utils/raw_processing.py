@@ -555,6 +555,50 @@ def convert_notes_to_seconds(notes: np.ndarray, bpm_events: np.ndarray, resoluti
     return note_times
 
 
+def time_to_tick(time_sec: np.ndarray, bpm: float, resolution: int) -> np.ndarray:
+    """
+    Convert a time in seconds to ticks based on the BPM and song resolution
+    """
+    ticks_per_second = (bpm / 60.0) * resolution
+    return np.round(time_sec * ticks_per_second).astype(int)
+
+
+def convert_notes_to_fixed_grid(notes: np.ndarray, grid_interval_sec: float = 0.02, resolution: int = 480) -> np.ndarray:
+    """
+    Converts notes from absolute time in seconds to a fixed grid representation based on the specified grid interval and resolution.
+    The fixed grid representation allows for easier processing during chart tokenization and model training, as it provides a consistent temporal structure for the note data.
+    Args:
+        - notes: numpy array of shape (num_notes, 14) where the first column is time in seconds and the rest are note data
+        - grid_interval_sec: the interval in seconds for the fixed grid (default is 20ms, which corresponds to a common frame rate for music processing)
+        - resolution: the song resolution (ticks per quarter note) to use for converting grid intervals back to ticks if needed
+    """
+    if notes is None or notes.shape[0] == 0:
+        raise ValueError("No notes provided for conversion")
+    
+    if grid_interval_sec <= 0:
+        raise ValueError("Grid interval must be a positive number")
+    
+    if resolution <= 0:
+        raise ValueError("Resolution must be a positive integer")
+    
+    quantized_bpm = (60.0 / (resolution * grid_interval_sec))  # calculate the BPM that corresponds to the specified grid interval and resolution
+
+    times_sec = notes[:, 0]   # first column is time in seconds
+    note_onsets = notes[:, 1:7].astype(int)    # columns 1-6 correspond to green, red, yellow, blue, orange, and open fret pressed data
+    note_sustains = notes[:, 7:13] # columns 7-12 correspond to green, red, yellow, blue, orange, and open fret sustain length data
+    note_types = notes[:, 13].astype(int)      # column 13 corresponds to note type (0 = regular, 1 = HOPO, 2 = TAP)
+
+    quantized_time = time_to_tick(times_sec, quantized_bpm, resolution)  # convert times to ticks based on quantized BPM and song resolution
+    quantized_note_sustains = time_to_tick(note_sustains, quantized_bpm, resolution)  # convert sustain lengths to ticks based on quantized BPM and song resolution
+
+    return np.hstack((quantized_time.reshape(-1, 1), note_onsets, quantized_note_sustains, note_types.reshape(-1, 1)))
+
+
+
+def calculate_quantized_bpm(grid_interval_sec: float = 0.02, resolution: int = 480) -> float:
+    return (60.0 / (resolution * grid_interval_sec))
+
+
 def calculate_note_density_summary(note_frames: np.ndarray) -> tuple[float, float, float, float, float]:
     """
     Utility function to calculate summary statistics about note onset times for a given song.

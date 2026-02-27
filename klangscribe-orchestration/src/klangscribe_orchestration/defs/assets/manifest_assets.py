@@ -7,7 +7,7 @@ import traceback
 from ...utils.audio_processing import opus_to_wav_bytes, merge_wav_bytes, merge_opus_bytes
 from ...utils.raw_processing import (
     parse_ini_file, get_empty_df_for_ini_metadata, add_ini_metadata_to_df, parse_chart_file,
-    convert_notes_to_seconds, calculate_note_density_summary
+    convert_notes_to_seconds, calculate_note_density_summary, convert_notes_to_fixed_grid
 )
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -1087,6 +1087,64 @@ def raw_chart_data_absolute_time(
 #   Fixed-Grid Chart Data Conversion Asset   #
 # ------------------------------------------ #
 
+# HELPERS
+
+@dataclass
+class ChartDataFixedGridResult:
+    dir_id: str
+    dirname: str
+    song_chart_bucket: Optional[str]
+    song_chart_prefix: Optional[str]
+    song_chart_key: Optional[str]
+    status: str
+    error: Optional[str]
+
+
+def _convert_chart_data_fixed_grid(
+    s3: S3Resource,
+    dir_id: str,
+    dirname: str,
+    chart_bucket: str,
+    chart_prefix: str,
+    chart_key: str,
+    out_bucket: str,
+    out_prefix: str
+) -> ChartDataFixedGridResult:
+    """
+    Converts absolute-time vectorized chart data into a fixed time grid representation, where each time step corresponds to a fixed interval (e.g. 20ms), 
+    and note events are represented in binary format indicating whether a note is active at each time step.
+    This asset also filters out any songs with a minimum note separation below 20ms to avoid issues with quantization in the fixed time grid representation.
+    """
+    try:
+        if not all([chart_bucket, chart_prefix, chart_key]):
+            return ChartDataFixedGridResult(dir_id, dirname, None, None, None, "skipped_no_chart", "No chart path provided")
+        
+        # (1) download absolute-time vectorized chart data .npy file from s3 into memory
+        abs_time_chart_data_bytes = s3.get_object(bucket_name=chart_bucket, obj_key=f"{chart_prefix}/{chart_key}")
+
+        # (2) load .npy file
+        note_data_abs_time = np.load(abs_time_chart_data_bytes)
+
+        # (3) convert absolute-time note data into fixed-grid representation
+        # using 20ms grid interval and 480 resolution (ticks per quarter note) (reasons described in project paper)
+        note_data_fixed_grid = convert_notes_to_fixed_grid(note_data_abs_time, grid_interval_sec=0.02, resolution=480)
+
+        # (4) store fixed-grid note data as .npy file back to s3
+        fixed_grid_chart_data_key = f"{dirname}/chart_data_fixed_grid.npy"
+        fixed_grid_chart_data_stream = io.BytesIO()
+        np.save(fixed_grid_chart_data_stream, note_data_fixed_grid)
+        s3.put_bytes(bucket_name=out_bucket, obj_key=f"{out_prefix}/{fixed_grid_chart_data_key}", data=fixed_grid_chart_data_stream.getvalue(), content_type="application/octet-stream")
+
+        return ChartDataFixedGridResult(dir_id, dirname, out_bucket, out_prefix, fixed_grid_chart_data_key, "success", None)
+
+    except Exception as e:
+        tbe = traceback.TracebackException.from_exception(e)
+        tb_str = ''.join(tbe.format())
+        err_str = '\n'.join([str(e), tb_str])
+        return ChartDataFixedGridResult(dir_id, dirname, None, None, None, "error", err_str)
+
+# ASSET DEFINITION
+
 @dg.asset(
     key=dg.AssetKey(["raw", "chart_data_fixed_grid"]),
     deps=[["raw", "chart_data_absolute_time"]],
@@ -1099,7 +1157,134 @@ def raw_chart_data_fixed_grid(
     """
     Converts absolute-time vectorized chart data into a fixed time grid representation, where each time step corresponds to a fixed interval (e.g. 20ms), 
     and note events are represented in binary format indicating whether a note is active at each time step.
+    This asset also filters out any songs with a minimum note separation below 20ms to avoid issues with quantization in the fixed time grid representation.
     """
     # (1) retrieve previous asset instance
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "chart_data_absolute_time"])
+
+    # get the manifest bucket/key from the parent asset metadata to read the absolute-time chart data and to determine where to store the fixed-grid chart data
+    manifest_bucket_entry = parent_asset_metadata.get('output_manifest_bucket')
+    if manifest_bucket_entry:
+        manifest_bucket = manifest_bucket_entry.value
+    manifest_key_entry = parent_asset_metadata.get('output_manifest_key')
+    if manifest_key_entry:
+        manifest_key = manifest_key_entry.value
+
+    context.log.info(f"located parent asset manifest: bucket={manifest_bucket}, key={manifest_key}")
+
+    # parse manifest parquet into memory (selecting only the relevant columns)
+    manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
+    manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
+    total_rows = manifest_df.height
+    context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
+
+    # get the stats data bucket/key from the parent asset metadata to read the note separation stats for filtering songs with very low note separation
+    stats_data_bucket_entry = parent_asset_metadata.get('stats_data_bucket')
+    if stats_data_bucket_entry:
+        stats_data_bucket = stats_data_bucket_entry.value
+    stats_data_key_entry = parent_asset_metadata.get('stats_data_key')
+    if stats_data_key_entry:
+        stats_data_key = stats_data_key_entry.value
     
-    pass
+    context.log.info(f"located parent asset stats data: bucket={stats_data_bucket}, key={stats_data_key}")
+
+    # parse stats data parquet into memory to get note separation stats for filtering
+    stats_data_bytes = s3.get_object(bucket_name=stats_data_bucket, obj_key=stats_data_key)
+    stats_df = pl.read_parquet(stats_data_bytes).select(["dir_id", "min_note_separation_sec"])
+
+    # join manifest_df with stats_df on dir_id to get the min_note_separation_sec for each song directory
+    manifest_stats_df = manifest_df.join(stats_df, on="dir_id", how="left")
+
+    # separate into kept vs filtered songs based on min_note_separation_sec
+    # filter out songs with min_note_separation_sec below 0.02 seconds (20ms) to avoid issues with quantization in the fixed time grid representation
+    # Note: this value is being hard-coded for now due to time constraints, but it could be made into a hyperparameter for tuning in the future
+    separation_threshold_sec = 0.02
+    filtered_df = manifest_stats_df.filter(pl.col("min_note_separation_sec") < separation_threshold_sec)    # songs which will be discarded from the dataset
+    kept_df = manifest_stats_df.filter(pl.col("min_note_separation_sec") >= separation_threshold_sec)       # songs which will be kept and processed into the fixed-grid representation
+
+    # store filtered songs manifest in s3 for later analysis (e.g. to analyze common characteristics of songs with very low note separation which were filtered out)
+    filtered_manifest_bucket = manifest_bucket
+    filtered_manifest_key = f"manifests/manifest_chart_data_fixed_grid_filtered_{context.run_id}.parquet"
+    buf = io.BytesIO()
+    filtered_df.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=filtered_manifest_bucket, obj_key=filtered_manifest_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    # define s3 storage bucket/key/obj name for fixed-grid vectorized chart data
+    out_bucket = manifest_bucket
+    out_prefix = "transformed/chart_fixed_grid"
+
+    # (2) convert absolute-time chart data into fixed-grid representation for kept songs, and store results in s3
+    results: List[dict] = []
+    success = 0
+    err = 0
+
+    # Submit tasks
+    start = time.perf_counter()
+    with ThreadPoolExecutor() as ex:
+        futures = [
+            ex.submit(
+                _convert_chart_data_fixed_grid,
+                s3,
+                row["dir_id"],
+                row["dirname"],
+                row["song_chart_bucket"],
+                row["song_chart_prefix"],
+                row["song_chart_key"],
+                out_bucket,
+                out_prefix
+            )
+            for row in kept_df.iter_rows(named=True)
+        ]
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if r.status == "success":
+                success += 1
+            else:
+                err += 1
+            
+            if i % 50 == 0:
+                context.log.info(f"Progress: {i}/{kept_df.height} success={success} error={err}")
+    end = time.perf_counter()
+    context.log.info(f"Completed fixed-grid chart data conversion for {kept_df.height} directories with {success} successes and {err} errors in {end - start:.2f} seconds")
+
+    # (3) write updated manifest (record status/error of fixed-grid chart data conversion)
+    out_manifest_bucket = manifest_bucket
+    out_manifest_key = f"manifests/manifest_chart_data_fixed_grid_{context.run_id}.parquet"
+    out_df = pl.DataFrame(
+        {
+            "dir_id": [r.dir_id for r in results],
+            "dirname": [r.dirname for r in results],
+            "song_chart_bucket": [r.song_chart_bucket for r in results],
+            "song_chart_prefix": [r.song_chart_prefix for r in results],
+            "song_chart_key": [r.song_chart_key for r in results],
+            "chart_data_conversion_status": [r.status for r in results],
+            "chart_data_conversion_error": [r.error for r in results]
+        }
+    )
+
+    # write parquet to bytes (S3 resource handles storage)
+    buf = io.BytesIO()
+    out_df.write_parquet(buf, compression="zstd")
+    data = buf.getvalue()
+    s3.put_bytes(bucket_name=out_manifest_bucket, obj_key=out_manifest_key, data=data, content_type="application/octet-stream")
+
+    # (4) write materialization result with metadata about the operation, including the number of songs filtered out due to low note separation
+
+    return dg.MaterializeResult(
+        metadata={
+            "input_manifest_bucket": dg.MetadataValue.text(manifest_bucket),
+            "input_manifest_key": dg.MetadataValue.text(manifest_key),
+            "input_stats_data_bucket": dg.MetadataValue.text(stats_data_bucket),
+            "input_stats_data_key": dg.MetadataValue.text(stats_data_key),
+            "output_manifest_bucket": dg.MetadataValue.text(out_manifest_bucket),
+            "output_manifest_key": dg.MetadataValue.text(out_manifest_key),
+            "filtered_manifest_bucket": dg.MetadataValue.text(filtered_manifest_bucket),
+            "filtered_manifest_key": dg.MetadataValue.text(filtered_manifest_key),
+            "songs_total": dg.MetadataValue.int(total_rows),
+            "song_success": dg.MetadataValue.int(success),
+            "song_error": dg.MetadataValue.int(err),
+            "songs_filtered": dg.MetadataValue.int(filtered_df.height),
+        }
+    )
