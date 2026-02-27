@@ -988,6 +988,7 @@ def raw_chart_data_absolute_time(
     # parse parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
     manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
+    manifest_df = manifest_df.filter(pl.col("chart_data_extraction_status") == "success")
     total_rows = manifest_df.height
     context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
 
@@ -1108,7 +1109,9 @@ def _convert_chart_data_fixed_grid(
     chart_prefix: str,
     chart_key: str,
     out_bucket: str,
-    out_prefix: str
+    out_prefix: str,
+    time_grid_interval_sec: float = 0.02,
+    resolution: int = 480
 ) -> ChartDataFixedGridResult:
     """
     Converts absolute-time vectorized chart data into a fixed time grid representation, where each time step corresponds to a fixed interval (e.g. 20ms), 
@@ -1127,7 +1130,7 @@ def _convert_chart_data_fixed_grid(
 
         # (3) convert absolute-time note data into fixed-grid representation
         # using 20ms grid interval and 480 resolution (ticks per quarter note) (reasons described in project paper)
-        note_data_fixed_grid = convert_notes_to_fixed_grid(note_data_abs_time, grid_interval_sec=0.02, resolution=480)
+        note_data_fixed_grid = convert_notes_to_fixed_grid(note_data_abs_time, grid_interval_sec=time_grid_interval_sec, resolution=resolution)
 
         # (4) store fixed-grid note data as .npy file back to s3
         fixed_grid_chart_data_key = f"{dirname}/chart_data_fixed_grid.npy"
@@ -1175,6 +1178,7 @@ def raw_chart_data_fixed_grid(
     # parse manifest parquet into memory (selecting only the relevant columns)
     manifest_bytes = s3.get_object(bucket_name=manifest_bucket, obj_key=manifest_key)
     manifest_df = pl.read_parquet(manifest_bytes).select(["dir_id", "dirname", "song_chart_bucket", "song_chart_prefix", "song_chart_key"])
+    manifest_df = manifest_df.filter(pl.col("chart_data_extraction_status") == "success")
     total_rows = manifest_df.height
     context.log.info(f"Loaded parent asset manifest: total={total_rows} chart directories")
 
@@ -1191,6 +1195,7 @@ def raw_chart_data_fixed_grid(
     # parse stats data parquet into memory to get note separation stats for filtering
     stats_data_bytes = s3.get_object(bucket_name=stats_data_bucket, obj_key=stats_data_key)
     stats_df = pl.read_parquet(stats_data_bytes).select(["dir_id", "min_note_separation_sec"])
+    context.log.info(f"Loaded stats data: total={stats_df.height} rows")
 
     # join manifest_df with stats_df on dir_id to get the min_note_separation_sec for each song directory
     manifest_stats_df = manifest_df.join(stats_df, on="dir_id", how="left")
@@ -1231,7 +1236,9 @@ def raw_chart_data_fixed_grid(
                 row["song_chart_prefix"],
                 row["song_chart_key"],
                 out_bucket,
-                out_prefix
+                out_prefix,
+                time_grid_interval_sec=separation_threshold_sec,   # use the same value as the filtering threshold for the grid interval to avoid quantization issues
+                resolution=480
             )
             for row in kept_df.iter_rows(named=True)
         ]
