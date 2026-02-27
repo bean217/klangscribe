@@ -966,12 +966,8 @@ def raw_chart_data_absolute_time(
     s3: S3Resource
 ) -> dg.MaterializeResult:
     """
-    Converts .chart files for each song into a vectorized format representing the note sequences in absolute time (milliseconds),
+    Converts .chart files for each song into a vectorized format representing the note sequences in absolute time (seconds),
     and stores this result in s3. This is an alternative to `raw_chart_data` which represents note sequences in tick-based format.
-    Each song is represented as an .npz file containing numpy arrays for:
-    - sync track (BPM changes with absolute time)
-    - note tracks (absolute-time note sequences)
-    - metadata (song resolution, offset)
     """
     # retrieve previous asset instance
     parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["raw", "chart_data"])
@@ -1085,3 +1081,25 @@ def raw_chart_data_absolute_time(
             "chart_data_extraction_error": dg.MetadataValue.int(err)
         }
     )
+
+
+# ------------------------------------------ #
+#   Fixed-Grid Chart Data Conversion Asset   #
+# ------------------------------------------ #
+
+@dg.asset(
+    key=dg.AssetKey(["raw", "chart_data_fixed_grid"]),
+    deps=[["raw", "chart_data_absolute_time"]],
+    kinds={"python", "s3", "parquet"}
+)
+def raw_chart_data_fixed_grid(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
+    """
+    Converts absolute-time vectorized chart data into a fixed time grid representation, where each time step corresponds to a fixed interval (e.g. 20ms), 
+    and note events are represented in binary format indicating whether a note is active at each time step.
+    """
+    # (1) retrieve previous asset instance
+    
+    pass
