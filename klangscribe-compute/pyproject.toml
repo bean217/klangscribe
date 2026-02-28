@@ -7,5 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.42.58",
     "dotenv>=0.9.9",
+    "polars>=1.38.1",
     "tqdm>=4.67.3",
 ]

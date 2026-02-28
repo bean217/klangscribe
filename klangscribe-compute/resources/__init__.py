@@ -1,0 +1,1 @@
+from .s3 import S3Resource, s3_resource
