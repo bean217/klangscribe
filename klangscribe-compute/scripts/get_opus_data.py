@@ -36,8 +36,8 @@ def download_opus(s3_resource: S3Resource, bucket_name: str, prefix: str, output
 
     It is assumed that the S3 prefix contains .opus files within subdirectories with the structure: {prefix}/{song_name}/{song}.opus
         For example: "collected_data/transformed/opus/unique_song_name/song.opus"
-    Downloaded songs will be saved to {output_dir}/{song_name}.opus
-        For example: "/local/path/unique_song_name.opus"
+    Downloaded songs will be saved to {output_dir}/unique_song_name/song.opus
+        For example: "/local/path/unique_song_name/song.opus"
     """
 
     # create output directory if it doesn't exist

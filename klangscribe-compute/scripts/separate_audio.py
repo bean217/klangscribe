@@ -43,7 +43,8 @@ def separate(file_paths: list[str], output_dir: str, device: str) -> tuple[pl.Da
             print(f"Error processing batch: {e}")
             error += 1
             file_statuses.append({"file": file_path, "status": "error", "error_message": format_exception(e)})
-    
+        pbar.set_postfix({"success": success, "error": error})
+
     file_statuses_df = pl.DataFrame(file_statuses)
     return file_statuses_df, success, error
 
