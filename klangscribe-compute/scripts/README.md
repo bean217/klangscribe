@@ -205,3 +205,9 @@ De-stem full song opus files by running `separate_audio.py`
 **Step 3:**
 Compress instrumental audio files by running `compress_separated.py`
 
+After running this step, copy the contents of the `output_dir` to `canonical/instr_songs`:
+
+```bash
+cd output_dir
+cp -r ./ ../canonical/instr_songs/
+```
