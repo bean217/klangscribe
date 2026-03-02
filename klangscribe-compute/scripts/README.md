@@ -152,7 +152,7 @@ python separate_audio.py \
 
 ---
 
-### (4) `format_separated.py`
+### (4) `compress_separated.py`
 
 **Purpose:** To compress the output of the `separate_audio.py` (3) script.
 

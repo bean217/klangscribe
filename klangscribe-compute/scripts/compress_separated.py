@@ -2,8 +2,7 @@
 # file: compress_separated.py
 # desc: Script to compress the output of the separate_audio.py script.
 #       This involves:
-#       1) Deleting the vocals.wav files that Demucs creates (we only care about the instrumental .wav files).
-#       2) Converting the instrumental .wav files to .opus format (for storage efficiency) and saving them in a new directory.
+#       1) Converting the instrumental .wav files to .opus format (for storage efficiency) and saving them in a new directory.
 # auth: Benjamin Piro (brp8396@rit.edu)
 # date: 28 February, 2026
 #
@@ -73,6 +72,7 @@ def main():
     parser.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing the separated audio files from Demucs (should contain subdirectories for each song with vocals.wav and instrumental.wav files).")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory where formatted .opus files will be saved.")
     parser.add_argument("--status_output", type=str, required=True, help="Path to save the parquet file containing processing statuses for each file.")
+    parser.add_argument("--stem", choices=["vocal", "instrumental"], required=True, help="The stem to compress.")
 
     # ensure that the status output path ends with .parquet
     if not parser.parse_args().status_output.endswith(".parquet"):
@@ -81,7 +81,14 @@ def main():
     args = parser.parse_args()
 
     # collect all instrumental .wav files
-    instrumental_files = glob.glob(os.path.join(args.input_dir, "*", "no_vocals.wav"))
+    if args.stem == "instrumental":
+        target_fname = "no_vocals.wav"
+    elif args.stem == "vocal":
+        target_fname = "vocals.wav"
+    else:
+        raise ValueError("Invalid stem choice. Must be 'vocal' or 'instrumental'.")
+
+    instrumental_files = glob.glob(os.path.join(args.input_dir, "*", target_fname))
 
     file_status, success, error = process_instrumental_files(instrumental_files, args.output_dir)
 
