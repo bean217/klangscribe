@@ -19,7 +19,6 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 from psycopg2 import sql
-from sklearn.model_selection import train_test_split
 from ..resources import PostgresResource, S3Resource
 
 
