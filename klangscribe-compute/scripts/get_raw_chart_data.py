@@ -50,7 +50,7 @@ def download_charts(s3_resource: S3Resource, chart_df, output_dir: str) -> None:
                 success += 1
             else:
                 error += 1
-                print(f"Error downloading .chart file: {result['error_message']}")
+                print(f"Error downloading .chart file: (sid={result['song_id']}, chart_path={result['chart_path']}) {result['error_message']}")
     print(f"Downloaded {success} .chart files successfully, {error} errors.")
 
 
