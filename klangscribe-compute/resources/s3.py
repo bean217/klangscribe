@@ -3,6 +3,8 @@ import boto3
 import dotenv
 from pathlib import Path
 dotenv.load_dotenv(Path(__file__).parent.parent / ".env")
+os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_required'
+os.environ['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_required'
 
 
 class S3Resource:
