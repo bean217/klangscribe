@@ -13,11 +13,13 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
 import dagster as dg
 import numpy as np
 import polars as pl
 import pyarrow as pa
 from psycopg2 import sql
+from sklearn.model_selection import train_test_split
 from ..resources import PostgresResource, S3Resource
 
 
@@ -1441,5 +1443,134 @@ def dataset_canonical_manifest(
             "input_chart_data_manifest_key": dg.MetadataValue.text(chart_manifest_key),
             "input_opus_data_manifest_bucket": dg.MetadataValue.text(opus_manifest_bucket),
             "input_opus_data_manifest_key": dg.MetadataValue.text(opus_manifest_key),
+        }
+    )
+
+
+######################
+#   Data Splitting   #
+######################
+
+# HELPERS
+
+# ASSET DEFINITION
+
+@dg.asset(
+    key=dg.AssetKey(["dataset", "data_splits"]),
+    deps=[["dataset", "canonical_manifest"]],
+    kinds={"python", "s3", "parquet"}
+)
+def dataset_data_splits(
+    context: dg.AssetExecutionContext,
+    s3: S3Resource
+) -> dg.MaterializeResult:
+    """
+    Creates an updated ini_metadata parquet file which assigns each song in the canonical ini_metadata to a data split (train/val/test), and stores this result in s3. 
+    The data splits are assigned using dir_id and artist to ensure that songs from the same artist are always in the same split (data leakage mitigation).
+    The split ratios are 80% train, 10% val, and 10% test.
+    """
+    # retrieve previous asset instance for dataset_canonical_manifest to get the manifest bucket/key and locate the relevant s3 file
+    parent_asset_metadata = _get_parent_asset_metadata(context, asset_key=["dataset", "canonical_manifest"])
+
+    ini_metadata_bucket_entry = parent_asset_metadata.get('canonical_ini_metadata_bucket')
+    if ini_metadata_bucket_entry:
+        ini_metadata_bucket = ini_metadata_bucket_entry.value
+    ini_metadata_key_entry = parent_asset_metadata.get('canonical_ini_metadata_key')
+    if ini_metadata_key_entry:
+        ini_metadata_key = ini_metadata_key_entry.value
+
+    context.log.info(f"located canonical manifest: bucket={ini_metadata_bucket}, key={ini_metadata_key}")
+    # parse canonical manifest parquet into memory
+    ini_metadata_bytes = s3.get_object(bucket_name=ini_metadata_bucket, obj_key=ini_metadata_key)
+    ini_metadata_df = pl.read_parquet(ini_metadata_bytes)
+
+    # Normalize genre and artist names, extract primary artist
+    working_metadata_df = (
+        ini_metadata_df
+        .with_columns(pl.col("genre").str.to_lowercase().str.strip_chars().alias("genre"))
+        .with_columns(pl.col("artist").str.to_lowercase().str.strip_chars().alias("artist"))
+        .with_columns(pl.col("artist").str.split(", ").list.first().alias("primary_artist"))
+    )
+
+    # Determine each artist's dominant genre (genre with the most songs for that artist)
+    artist_dominant_genre = (
+        working_metadata_df
+        .group_by("primary_artist", "genre")
+        .agg(pl.len().alias("genre_count"))
+        .sort("genre_count", descending=True)
+        .group_by("primary_artist", maintain_order=True)
+        .first()
+        .select(pl.col("primary_artist"), pl.col("genre").alias("dominant_genre"))
+    )
+
+    # Get total song count per artist
+    artist_song_counts = (
+        working_metadata_df
+        .group_by("primary_artist")
+        .agg(pl.len().alias("song_count"))
+    )
+
+    # Join: (primary_artist, dominant_genre, song_count)
+    artist_info = (
+        artist_dominant_genre
+        .join(artist_song_counts, on="primary_artist")
+        .sort("song_count", descending=True)  # process largest artists first for better packing
+    )
+
+    # Greedy per-genre assignment to maintain genre distribution across 80/10/10 splits.
+    # Within each genre, artists are assigned to whichever split has the largest remaining
+    # deficit (target - current) for that genre, so the ratio is preserved locally.
+    RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
+    artist_to_split: dict[str, str] = {}
+
+    for genre in artist_info["dominant_genre"].unique().to_list():
+        genre_artists = (
+            artist_info
+            .filter(pl.col("dominant_genre") == genre)
+            .sort("song_count", descending=True)
+        )
+        genre_total = genre_artists["song_count"].sum()
+        counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
+        targets = {s: r * genre_total for s, r in RATIOS.items()}
+
+        for row in genre_artists.iter_rows(named=True):
+            best_split = max(targets, key=lambda s: targets[s] - counts[s])
+            artist_to_split[row["primary_artist"]] = best_split
+            counts[best_split] += row["song_count"]
+
+        context.log.info(
+            f"genre={genre!r} total={genre_total} "
+            + " ".join(f"{s}={counts[s]}" for s in RATIOS)
+        )
+
+    # Assign split labels and build per-split dir_id frames
+    result_df = working_metadata_df.with_columns(
+        pl.col("primary_artist").replace(artist_to_split).alias("split")
+    )
+
+    train_data = result_df.filter(pl.col("split") == "train").select("dir_id")
+    val_data = result_df.filter(pl.col("split") == "val").select("dir_id")
+    test_data = result_df.filter(pl.col("split") == "test").select("dir_id")
+
+    # Join split labels onto the original ini_metadata_df and write to s3
+    split_labels = result_df.select(["dir_id", "split"])
+    ini_metadata_with_splits = ini_metadata_df.join(split_labels, on="dir_id", how="left")
+
+    out_bucket = ini_metadata_bucket
+    out_key = f"canonical/ini_metadata_data_splits_{context.run_id}.parquet"
+    buf = io.BytesIO()
+    ini_metadata_with_splits.write_parquet(buf, compression="zstd")
+    s3.put_bytes(bucket_name=out_bucket, obj_key=out_key, data=buf.getvalue(), content_type="application/octet-stream")
+
+    return dg.MaterializeResult(
+        metadata={
+            "canonical_ini_metadata_bucket": dg.MetadataValue.text(ini_metadata_bucket),
+            "canonical_ini_metadata_key": dg.MetadataValue.text(ini_metadata_key),
+            "data_splits_manifest_bucket": dg.MetadataValue.text(out_bucket),
+            "data_splits_manifest_key": dg.MetadataValue.text(out_key),
+            "songs_total": dg.MetadataValue.int(ini_metadata_df.height),
+            "songs_train": dg.MetadataValue.int(train_data.height),
+            "songs_val": dg.MetadataValue.int(val_data.height),
+            "songs_test": dg.MetadataValue.int(test_data.height),
         }
     )
